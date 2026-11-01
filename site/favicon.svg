@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- crypto-drive mark: a drive slot with a lock bar. AGPL-3.0-or-later, (C) 2026 Marcel Joachim Kloubert -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#121316" stroke="#2a2a2e" stroke-width="2"/>
+  <path d="M22 28v-5a10 10 0 0 1 20 0v5" fill="none" stroke="#f2f1ee" stroke-width="4" stroke-linecap="round"/>
+  <rect x="15" y="28" width="34" height="22" rx="5" fill="#f2f1ee"/>
+  <rect x="21" y="37" width="16" height="4" rx="2" fill="#e0662f"/>
+  <circle cx="42" cy="39" r="2.4" fill="#0b0b0c"/>
+</svg>
