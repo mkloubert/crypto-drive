@@ -100,7 +100,15 @@ crypto-drive unmount ~/drive
 - `mount --daemon` runs in the background after a successful mount. Errors
   that happen later are not shown.
 - Ctrl+C, SIGTERM and closing the terminal (SIGHUP) unmount the drive
-  cleanly and write all buffers first.
+  cleanly and write all buffers first. If the drive is busy (a program has
+  a file open, or a terminal is inside it), it stays mounted and keeps
+  working: the buffers are written and a warning tells you to close those
+  programs and stop again, or to run `crypto-drive unmount --force <mountpoint>`.
+  (In daemon mode the warning is not shown.)
+- If a drive process was killed without an unmount, the mount point is left
+  dead ("Transport endpoint is not connected" on Linux, "Device not
+  configured" on macOS). `mount` then points to
+  `crypto-drive unmount --force <mountpoint>`.
 - `-o OPT` passes a FUSE option to macFUSE or Linux FUSE.
 - `unmount` uses `umount` on macOS and `fusermount3 -u` on Linux. Use
   `--force` for a busy drive.

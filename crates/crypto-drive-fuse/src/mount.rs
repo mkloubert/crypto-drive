@@ -24,7 +24,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 /// Number of FUSE worker threads on this OS.
 ///
@@ -125,22 +125,37 @@ struct Running {
 }
 
 impl Running {
-    /// Unmounts the drive and waits until the background thread has ended.
-    fn unmount_and_join(self) -> io::Result<()> {
-        #[cfg(target_os = "macos")]
-        {
-            // fuser did not mount, so it would not unmount: do it here. If
-            // this fails (busy), the session keeps running in the background.
-            self.mount.unmount()?;
-            self.session.join()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.session.umount_and_join()
-        }
+    /// Tries a normal (not forced) unmount. A busy drive gives an error and
+    /// stays mounted; the background thread keeps serving it.
+    ///
+    /// macOS: `unmount(2)` without flags (EBUSY when busy).
+    /// Linux: `fusermount3 -u` without `-z`. fuser's own unmount would
+    /// detach the drive lazily (`-z`): the process then waited, without a
+    /// word, until the last program left the drive.
+    #[cfg(target_os = "macos")]
+    fn try_unmount(&self, _mountpoint: &Path) -> io::Result<()> {
+        self.mount.unmount()
     }
 
-    /// Waits until the background thread has ended (after an outside unmount).
+    /// See the macOS variant.
+    #[cfg(not(target_os = "macos"))]
+    fn try_unmount(&self, mountpoint: &Path) -> io::Result<()> {
+        let out = unmount_command(mountpoint, false).output()?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(io::Error::new(
+            io::ErrorKind::ResourceBusy,
+            if text.is_empty() {
+                format!("fusermount3 failed: {}", out.status)
+            } else {
+                text
+            },
+        ))
+    }
+
+    /// Waits until the background thread has ended (after an unmount).
     fn join(self) -> io::Result<()> {
         self.session.join()
     }
@@ -162,7 +177,9 @@ fn stop_signals() -> SigSet {
 }
 
 /// Mounts the drive, calls `ready` once the mount exists and blocks until
-/// SIGINT/SIGTERM/SIGHUP or an outside unmount.
+/// SIGINT/SIGTERM/SIGHUP or an outside unmount. A signal while the drive
+/// is busy writes the buffers, logs a warning and keeps the drive mounted
+/// (see `wait_for_stop`); the next signal tries again.
 ///
 /// These signals are blocked in the calling thread (and so in all threads
 /// started from it) and are taken by a waiter thread. That thread stays
@@ -193,30 +210,70 @@ pub fn mount_and_wait(
     });
     ready();
 
-    let reason = stop_rx.recv().unwrap_or(StopReason::Unmounted);
-    match reason {
-        StopReason::Signal => {
-            let unmounted = running.unmount_and_join();
+    let reason = wait_for_stop(
+        &stop_rx,
+        || running.try_unmount(&req.mountpoint),
+        |e| {
+            // Keep the data safe in case the process is killed while busy.
             if let Err(e) = fs.flush_all() {
-                log::warn!("could not write all buffers after unmount: {e}");
+                log::warn!("could not write all buffers: {e}");
             }
-            unmounted?;
-        }
-        StopReason::Unmounted => running.join()?,
+            log::warn!("{}", busy_message(&req.mountpoint, e));
+        },
+    );
+    running.join()?;
+    if reason == StopReason::Signal
+        && let Err(e) = fs.flush_all()
+    {
+        log::warn!("could not write all buffers after unmount: {e}");
     }
     Ok(reason)
 }
 
-/// Runs `wait` in a thread; when it returns true, sends `reason`.
+/// Waits for the end of the mount. A stop signal tries `try_unmount`; if
+/// that fails (the drive is busy), `on_busy` is told and the drive stays
+/// mounted until the next signal or an outside unmount. Before, the
+/// process ended anyway and left a dead mount ("Device not configured" on
+/// macOS, "Transport endpoint is not connected" on Linux). A closed
+/// channel counts as an outside unmount.
+fn wait_for_stop(
+    stop_rx: &Receiver<StopReason>,
+    mut try_unmount: impl FnMut() -> io::Result<()>,
+    mut on_busy: impl FnMut(&io::Error),
+) -> StopReason {
+    loop {
+        match stop_rx.recv().unwrap_or(StopReason::Unmounted) {
+            StopReason::Unmounted => return StopReason::Unmounted,
+            StopReason::Signal => match try_unmount() {
+                Ok(()) => return StopReason::Signal,
+                Err(e) => on_busy(&e),
+            },
+        }
+    }
+}
+
+/// The note for a stop signal that could not unmount a busy drive.
+fn busy_message(mountpoint: &Path, e: &io::Error) -> String {
+    format!(
+        "the drive is busy and stays mounted ({e}); close the programs that use {mp} \
+         and stop again, or run `crypto-drive unmount --force {mp}`",
+        mp = mountpoint.display()
+    )
+}
+
+/// Runs `wait` in a thread and sends `reason` each time it returns true,
+/// until it returns false or the receiver is gone (the mount loop ended).
+/// A loop, so a second stop signal after a busy unmount is seen too.
 fn forward(
     tx: Sender<StopReason>,
     reason: StopReason,
-    wait: impl FnOnce() -> bool + Send + 'static,
+    mut wait: impl FnMut() -> bool + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        if wait() {
-            // The receiver is gone when the mount loop has ended.
-            let _ = tx.send(reason);
+        while wait() {
+            if tx.send(reason).is_err() {
+                break;
+            }
         }
     });
 }
@@ -262,6 +319,86 @@ mod tests {
         assert_eq!(texts[1], "default_permissions");
         assert_eq!(texts.last().unwrap(), "backend=x");
         assert!(option_text(&MountOption::RO).is_err());
+    }
+
+    fn busy() -> io::Error {
+        io::Error::from(io::ErrorKind::ResourceBusy)
+    }
+
+    /// Runs `wait_for_stop` on `events` with unmount results taken from
+    /// `unmounts` in order; returns the reason, the number of unmount
+    /// tries and the number of busy reports.
+    fn stop_with(
+        events: &[StopReason],
+        unmounts: Vec<io::Result<()>>,
+    ) -> (StopReason, usize, usize) {
+        let (tx, rx) = channel();
+        for e in events {
+            tx.send(*e).unwrap();
+        }
+        drop(tx);
+        let mut results = unmounts.into_iter();
+        let (mut tries, mut busy_reports) = (0, 0);
+        let reason = wait_for_stop(
+            &rx,
+            || {
+                tries += 1;
+                results.next().expect("unexpected unmount try")
+            },
+            |_| busy_reports += 1,
+        );
+        (reason, tries, busy_reports)
+    }
+
+    #[test]
+    fn signal_with_a_free_drive_unmounts_once() {
+        assert_eq!(
+            stop_with(&[StopReason::Signal], vec![Ok(())]),
+            (StopReason::Signal, 1, 0)
+        );
+    }
+
+    #[test]
+    fn signal_with_a_busy_drive_keeps_it_mounted_until_the_next_signal() {
+        let events = [StopReason::Signal, StopReason::Signal];
+        assert_eq!(
+            stop_with(&events, vec![Err(busy()), Ok(())]),
+            (StopReason::Signal, 2, 1)
+        );
+    }
+
+    #[test]
+    fn busy_drive_unmounted_from_outside_stops_without_a_new_try() {
+        let events = [StopReason::Signal, StopReason::Unmounted];
+        assert_eq!(
+            stop_with(&events, vec![Err(busy())]),
+            (StopReason::Unmounted, 1, 1)
+        );
+    }
+
+    #[test]
+    fn outside_unmount_or_a_closed_channel_needs_no_try() {
+        assert_eq!(
+            stop_with(&[StopReason::Unmounted], vec![]),
+            (StopReason::Unmounted, 0, 0)
+        );
+        assert_eq!(stop_with(&[], vec![]), (StopReason::Unmounted, 0, 0));
+    }
+
+    #[test]
+    fn busy_message_names_the_way_out() {
+        let m = busy_message(Path::new("/mnt/x"), &busy());
+        assert!(
+            m.starts_with("the drive is busy and stays mounted ("),
+            "{m}"
+        );
+        assert!(
+            m.ends_with(
+                "close the programs that use /mnt/x and stop again, or run \
+                 `crypto-drive unmount --force /mnt/x`"
+            ),
+            "{m}"
+        );
     }
 
     #[test]

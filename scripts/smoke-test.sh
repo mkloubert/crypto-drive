@@ -287,9 +287,60 @@ run_round() {
     unmount_vault
 }
 
+# Starts a mount in the foreground (in the background of this shell) and
+# sets FG_PID. Waits until big.bin shows in the drive. Tries again while
+# the old daemon still holds the vault lock.
+start_foreground_mount() {
+    tries=0
+    while :; do
+        "$BIN" mount "$VAULT" "$MNT" --key-file "$KEY" ${MOUNT_OPTS[@]+"${MOUNT_OPTS[@]}"} \
+            --password-fd 3 3<<<"$PASSWORD" 2>"$WORK/fg.err" &
+        FG_PID=$!
+        MOUNTED=1
+        waited=0
+        while [ ! -e "$MNT/big.bin" ] && kill -0 "$FG_PID" 2>/dev/null && [ "$waited" -lt 100 ]; do
+            sleep 0.2
+            waited=$((waited + 1))
+        done
+        if [ -e "$MNT/big.bin" ]; then
+            return 0
+        fi
+        MOUNTED=0
+        if ! kill -0 "$FG_PID" 2>/dev/null && grep -q "already mounted" "$WORK/fg.err"; then
+            tries=$((tries + 1))
+            if [ "$tries" -lt 20 ]; then
+                sleep 0.5
+                continue
+            fi
+        fi
+        cat "$WORK/fg.err" >&2
+        echo "Foreground mount did not come up" >&2
+        return 1
+    done
+}
+
 # Run everything twice: a normal vault and one made with --pad-sizes.
 for PAD in "" "--pad-sizes"; do
     run_round "$PAD"
 done
+
+# 11. A stop signal while the drive is busy must keep it mounted (no dead
+# mount), and the next signal after the drive is free must unmount it.
+echo "== busy stop =="
+start_foreground_mount
+exec 4<"$MNT/big.bin"
+kill -TERM "$FG_PID"
+sleep 2
+kill -0 "$FG_PID"
+grep -q "the drive is busy and stays mounted" "$WORK/fg.err"
+have="$(sha256 "$MNT/big.bin" | cut -d' ' -f1)"
+[ "$want" = "$have" ]
+ok busy-stop-keeps-the-drive
+exec 4<&-
+kill -TERM "$FG_PID"
+wait "$FG_PID"
+MOUNTED=0
+[ ! -e "$MNT/big.bin" ]
+ok stop-after-busy-unmounts
 
 echo "All smoke tests passed."

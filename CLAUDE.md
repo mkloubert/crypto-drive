@@ -164,7 +164,7 @@ shared `Arc<Mutex<OpenFile>>` per real file for all handles, handle table.
 | `inodes` | `InodeTable`: inode ↔ clear path, lookup counts, `forget`, rename of subtrees by range (sorted map). |
 | `xattrs` | In-memory xattrs per clear path (never on disk). 1 MiB per entry, 64 MiB total; values over the limit are accepted but dropped. Linux keeps only `user.*`. |
 | `errno` | `to_errno`: core error → errno (spec section 8 table). |
-| `mount` | `MountRequest`, `mount_and_wait`, `mount_options`, `unmount_command`, `StopReason`. |
+| `mount` | `MountRequest`, `mount_and_wait`, `mount_options`, `unmount_command`, `StopReason`. A stop signal tries a normal unmount (`Running::try_unmount`: macOS `unmount(2)`, Linux `fusermount3 -u` without `-z`); if busy, `wait_for_stop` writes the buffers, logs a warning and keeps the drive mounted until the next signal or an outside unmount. |
 | `macos_mount` | macOS only: mounts through libfuse 2 `fuse_mount()` (fuser's own `fuse_mount_compat25` fails with macFUSE 5.5). `build.rs` adds `/usr/local/lib` or `FUSE_LIB_DIR` to the link path. |
 
 fuser features: macOS `macos-no-mount` + `macfuse-4-compat`; Linux default
@@ -188,7 +188,8 @@ fuser features: macOS `macos-no-mount` + `macfuse-4-compat`; Linux default
   `~/.crypto-drive/keys/<YYYYMMDDhhmmsszzz>_<VAULT_NAME>.cd-key`.
 - `cmd/*.rs`: one file per subcommand: `init`, `mount` (incl. `--daemon`:
   fork before any thread, status pipe, `setsid`, stdio to `/dev/null`;
-  SIGINT/SIGTERM/SIGHUP unmount cleanly), `unmount`, `passwd`, `rotate-key`,
+  SIGINT/SIGTERM/SIGHUP unmount cleanly, a busy drive stays mounted; a dead
+  mount point (ENOTCONN / ENXIO) gets an `unmount --force` hint), `unmount`, `passwd`, `rotate-key`,
   `recovery-key`, `recover`, `check`.
 
 Environment variables: `CRYPTO_DRIVE_PASSWORD`, `CRYPTO_DRIVE_NEW_PASSWORD`,
@@ -352,6 +353,7 @@ Always first: `export PATH="$HOME/.cargo/bin:$PATH"`
 | One crate / test | `cargo test -p crypto-drive-core --test tamper` |
 | Format check | `cargo fmt --all -- --check` |
 | Lint | `cargo clippy --workspace --all-targets -- -D warnings` |
+| macOS cross-check (no link) | `cargo clippy --workspace --target aarch64-apple-darwin -- -D warnings` and `cargo clippy -p crypto-drive-fuse -p crypto-drive --tests --target aarch64-apple-darwin -- -D warnings` (`--all-targets` fails: criterion's `alloca` needs a mac C compiler) |
 | Licenses / advisories | `cargo deny check` (advisories need network) |
 | License headers | `scripts/check-license-headers.sh` |
 | Benchmarks | `cargo bench -p crypto-drive-core --bench throughput` |
@@ -361,12 +363,13 @@ Always first: `export PATH="$HOME/.cargo/bin:$PATH"`
 | KAT cross-check | `python -I scripts/kat/gen_vectors.py` (needs `cryptography` 44) |
 
 Definition of done for code changes: fmt, clippy, all workspace tests and
-the header check are green in the container. If FUSE code changed, ask the
+the header check are green in the container; after changes to
+`#[cfg(target_os = "macos")]` code also the macOS cross-check. If FUSE code changed, ask the
 owner to run the mount tests and the smoke test on the Mac (one command per
 block).
 
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
-clean, `cargo test --workspace`: 493 passed, 0 failed, 10 ignored (9 mount
+clean, `cargo test --workspace`: 499 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator).
 
 ## 8. Platform notes
@@ -471,8 +474,9 @@ does not repair. Details: README "Threat model" and "Limits".
   open-file limit fixed (CLI raises `RLIMIT_NOFILE`, core sizes the
   directory cache from it); `set_times` on an open file flushes its buffer
   first, so `cp -p` / copyfile keep the mtime (new mount test
-  `mtime_set_before_close_is_kept`, to run on the Mac). Next: do not leave a
-  dead mount when a stop signal meets a busy drive.
+  `mtime_set_before_close_is_kept`, to run on the Mac); a stop signal with a
+  busy drive keeps it mounted instead of leaving a dead mount (smoke test
+  step 11 "busy stop", to run on the Mac). Next: `lock_vault` in `passwd`.
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;

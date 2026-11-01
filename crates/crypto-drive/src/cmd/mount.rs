@@ -61,12 +61,9 @@ pub fn validate_mount_paths(vault_dir: &Path, mountpoint: &Path) -> Result<(), C
             vault_dir.display()
         ))
     })?;
-    let mp = mountpoint.canonicalize().map_err(|e| {
-        CliError::Usage(format!(
-            "the mount point does not exist: {}: {e}",
-            mountpoint.display()
-        ))
-    })?;
+    let mp = mountpoint
+        .canonicalize()
+        .map_err(|e| CliError::Usage(mount_point_error(mountpoint, &e)))?;
     if mp.starts_with(&vault) || vault.starts_with(&mp) {
         return Err(CliError::Usage(NESTED.into()));
     }
@@ -77,6 +74,28 @@ pub fn validate_mount_paths(vault_dir: &Path, mountpoint: &Path) -> Result<(), C
         return Err(CliError::Usage("the mount point is not empty".into()));
     }
     Ok(())
+}
+
+/// The message for a mount point that cannot be resolved. A drive whose
+/// process ended without an unmount (killed, crashed) leaves a dead mount:
+/// Linux reports ENOTCONN ("Transport endpoint is not connected"), macOS
+/// ENXIO ("Device not configured"). Then the message names the way out.
+fn mount_point_error(mountpoint: &Path, e: &std::io::Error) -> String {
+    let mut message = format!(
+        "the mount point does not exist: {}: {e}",
+        mountpoint.display()
+    );
+    let dead = [nix::errno::Errno::ENOTCONN, nix::errno::Errno::ENXIO]
+        .iter()
+        .any(|errno| e.raw_os_error() == Some(*errno as i32));
+    if dead {
+        message.push_str(&format!(
+            "\nthe mount point looks like a drive that was not unmounted cleanly; \
+             run `crypto-drive unmount --force {}`",
+            mountpoint.display()
+        ));
+    }
+    message
 }
 
 /// The volume name: the vault directory's name without `,` and `=`.
@@ -374,6 +393,30 @@ mod tests {
         let (dir, vault, _mnt) = setup();
         let m = usage(validate_mount_paths(&vault, &dir.path().join("nope")));
         assert!(m.starts_with("the mount point does not exist"), "{m}");
+    }
+
+    #[test]
+    fn dead_mount_point_gets_a_hint() {
+        let mp = Path::new("/mnt/x");
+        let hint = "\nthe mount point looks like a drive that was not unmounted \
+                    cleanly; run `crypto-drive unmount --force /mnt/x`";
+        for errno in [libc_errno::ENOTCONN, libc_errno::ENXIO] {
+            let e = std::io::Error::from_raw_os_error(errno);
+            let m = mount_point_error(mp, &e);
+            assert!(
+                m.starts_with("the mount point does not exist: /mnt/x: "),
+                "{m}"
+            );
+            assert!(m.ends_with(hint), "{m}");
+        }
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!mount_point_error(mp, &missing).contains("unmount"));
+    }
+
+    /// Errno values without a `libc` dependency on Linux.
+    mod libc_errno {
+        pub const ENOTCONN: i32 = nix::errno::Errno::ENOTCONN as i32;
+        pub const ENXIO: i32 = nix::errno::Errno::ENXIO as i32;
     }
 
     #[test]
