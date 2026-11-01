@@ -32,7 +32,8 @@ use crate::keys::{EntryId, random_entry_id};
 use crate::names::BackingName;
 use crate::vault::{CONTENT_FILE, NAME_FILE};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
+use std::time::{Duration, Instant};
 
 /// Mode of the `.cd-cdl` directory of a long file name.
 pub(super) const LONG_ENTRY_MODE: u32 = 0o700;
@@ -451,6 +452,36 @@ impl CryptoFs {
     }
 
     /// Flushes every open file; returns the first error after trying all.
+    /// Flushes the open files whose unwritten changes rested for `idle` or
+    /// are older than `max_age` (see `OpenFile::flush_if_idle`). Call it at
+    /// regular times; returns how many files it flushed. A file that a
+    /// request holds right now is skipped and looked at in the next call,
+    /// so this never waits behind a long operation. Errors are logged; the
+    /// file is tried again after `max_age`.
+    pub fn flush_idle(&self, now: Instant, idle: Duration, max_age: Duration) -> usize {
+        let open: Vec<Shared> = self
+            .open_files
+            .lock()
+            .expect("open files lock poisoned")
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let mut flushed = 0;
+        for file in open {
+            let mut open = match file.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => continue,
+                Err(TryLockError::Poisoned(_)) => panic!("open file lock poisoned"),
+            };
+            match open.flush_if_idle(now, idle, max_age) {
+                Ok(true) => flushed += 1,
+                Ok(false) => {}
+                Err(e) => log::warn!("could not write the buffered changes of an open file: {e}"),
+            }
+        }
+        flushed
+    }
+
     pub fn flush_all(&self) -> Result<()> {
         let open: Vec<Shared> = self
             .open_files
@@ -473,7 +504,7 @@ impl CryptoFs {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CryptoFs, FileHandleId, FileKind, VPath};
+    use super::super::{CryptoFs, FileHandleId, FileKind, IDLE_FLUSH_AFTER, MAX_DIRTY_AGE, VPath};
     use crate::Error;
     use crate::content::ciphertext_size;
     use crate::keys::{DirId, MasterKey};
@@ -482,6 +513,7 @@ mod tests {
     use crate::vault::{CONTENT_FILE, CONTROL_PREFIX, NAME_FILE, UnlockedVault};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::time::Instant;
 
     struct Fx {
         _tmp: tempfile::TempDir,
@@ -933,6 +965,41 @@ mod tests {
         f.fs.write(h, 4, b"x").unwrap();
         f.fs.release(h).unwrap();
         assert_eq!(read_file(&f.fs, "f"), b"0123x");
+    }
+
+    #[test]
+    fn flush_idle_writes_files_that_rest_and_skips_busy_ones() {
+        let f = fx();
+        let (_, a) = f.fs.create(&p("a"), 0o644).unwrap();
+        let (_, b) = f.fs.create(&p("b"), 0o644).unwrap();
+        f.fs.write(a, 0, b"aaaa").unwrap();
+        f.fs.write(b, 0, b"bb").unwrap();
+        let start = Instant::now();
+        assert_eq!(f.fs.flush_idle(start, IDLE_FLUSH_AFTER, MAX_DIRTY_AGE), 0);
+        f.fs.write(b, 2, b"bb").unwrap();
+        let busy = f.fs.handle(b).unwrap().0;
+        let guard = busy.lock().unwrap();
+        // `a` rested; `b` is locked by another request and is skipped.
+        let later = start + IDLE_FLUSH_AFTER;
+        assert_eq!(f.fs.flush_idle(later, IDLE_FLUSH_AFTER, MAX_DIRTY_AGE), 1);
+        drop(guard);
+        let mut sizes = real_file_sizes(&f.root);
+        sizes.sort();
+        assert_eq!(
+            sizes,
+            vec![ciphertext_size(0, false), ciphertext_size(4, false)]
+        );
+        f.fs.release(a).unwrap();
+        f.fs.release(b).unwrap();
+    }
+
+    fn real_file_sizes(root: &Path) -> Vec<u64> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| !e.file_name().to_str().unwrap().starts_with(CONTROL_PREFIX))
+            .map(|e| e.metadata().unwrap().len())
+            .collect()
     }
 
     #[test]

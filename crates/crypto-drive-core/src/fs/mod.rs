@@ -37,7 +37,19 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+/// The mounted drive writes the buffered changes of an open file after
+/// they rested this long (see `CryptoFs::flush_idle`).
+pub const IDLE_FLUSH_AFTER: Duration = Duration::from_secs(5);
+
+/// The mounted drive writes buffered changes at the latest after this
+/// time, also for a file that is written all the time (like the kernel's
+/// own write-back of about 30 seconds).
+pub const MAX_DIRTY_AGE: Duration = Duration::from_secs(30);
+
+/// How often the mounted drive looks for buffered changes to write.
+pub const IDLE_FLUSH_TICK: Duration = Duration::from_secs(1);
 
 /// Most directory states kept in the cache.
 const MAX_CACHE_CAPACITY: usize = 1024;

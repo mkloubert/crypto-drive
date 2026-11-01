@@ -17,14 +17,15 @@
 //! Mounting and unmounting.
 
 use crate::FuseFs;
-use crypto_drive_core::fs::CryptoFs;
+use crypto_drive_core::fs::{CryptoFs, IDLE_FLUSH_AFTER, IDLE_FLUSH_TICK, MAX_DIRTY_AGE};
 use fuser::{Config, MountOption};
 use nix::sys::signal::{SigSet, Signal};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
 
 /// Number of FUSE worker threads on this OS.
 ///
@@ -201,6 +202,12 @@ pub fn mount_and_wait(
     config.mount_options = mount_options(req);
     config.n_threads = Some(fuse_threads());
     let running = start(FuseFs::new(Arc::clone(&fs), Some(destroy_tx)), req, &config)?;
+    let idle_flusher = start_idle_flusher(
+        Arc::clone(&fs),
+        IDLE_FLUSH_TICK,
+        IDLE_FLUSH_AFTER,
+        MAX_DIRTY_AGE,
+    );
 
     forward(stop_tx.clone(), StopReason::Signal, move || {
         signals.wait().is_ok()
@@ -221,6 +228,7 @@ pub fn mount_and_wait(
             log::warn!("{}", busy_message(&req.mountpoint, e));
         },
     );
+    drop(idle_flusher);
     running.join()?;
     if reason == StopReason::Signal
         && let Err(e) = fs.flush_all()
@@ -228,6 +236,26 @@ pub fn mount_and_wait(
         log::warn!("could not write all buffers after unmount: {e}");
     }
     Ok(reason)
+}
+
+/// Starts a thread that writes the buffered changes of open files once
+/// they rested for `idle` or are older than `max_age`; it looks every
+/// `tick`. Without it, changes of a file that stays open (a log, a VM
+/// image) stayed in memory until close or fsync. Dropping the returned
+/// sender stops the thread.
+fn start_idle_flusher(
+    fs: Arc<CryptoFs>,
+    tick: Duration,
+    idle: Duration,
+    max_age: Duration,
+) -> Sender<()> {
+    let (stop_tx, stop_rx) = channel::<()>();
+    std::thread::spawn(move || {
+        while let Err(RecvTimeoutError::Timeout) = stop_rx.recv_timeout(tick) {
+            fs.flush_idle(Instant::now(), idle, max_age);
+        }
+    });
+    stop_tx
 }
 
 /// Waits for the end of the mount. A stop signal tries `try_unmount`; if
@@ -319,6 +347,47 @@ mod tests {
         assert_eq!(texts[1], "default_permissions");
         assert_eq!(texts.last().unwrap(), "backend=x");
         assert!(option_text(&MountOption::RO).is_err());
+    }
+
+    /// Sizes of the real files of a vault (control files left out).
+    fn real_file_sizes(root: &Path) -> Vec<u64> {
+        let mut sizes: Vec<u64> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| !e.file_name().to_string_lossy().starts_with(".cd-"))
+            .map(|e| e.metadata().unwrap().len())
+            .collect();
+        sizes.sort();
+        sizes
+    }
+
+    #[test]
+    fn idle_flusher_writes_resting_changes_and_stops_when_dropped() {
+        use crypto_drive_core::content::ciphertext_size;
+        use crypto_drive_core::fs::VPath;
+        use std::time::{Duration, Instant};
+
+        let (_tmp, vault, _mk) = crypto_drive_core::testutil::test_vault();
+        let root = vault.root_path.clone();
+        let fs = Arc::new(CryptoFs::new(vault).unwrap());
+        let (_, fh) = fs.create(&VPath::parse("/log").unwrap(), 0o644).unwrap();
+        fs.write(fh, 0, b"line 1\n").unwrap();
+        let ms = Duration::from_millis;
+        let stop = start_idle_flusher(Arc::clone(&fs), ms(10), ms(50), ms(500));
+        let want = vec![ciphertext_size(7, false)];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while real_file_sizes(&root) != want && Instant::now() < deadline {
+            std::thread::sleep(ms(10));
+        }
+        assert_eq!(real_file_sizes(&root), want);
+        drop(stop);
+        // The thread has stopped: it no longer holds the drive.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&fs) > 1 && Instant::now() < deadline {
+            std::thread::sleep(ms(10));
+        }
+        assert_eq!(Arc::strong_count(&fs), 1);
+        fs.release(fh).unwrap();
     }
 
     fn busy() -> io::Error {

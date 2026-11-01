@@ -142,7 +142,7 @@ without a mount.
 | `keys` | Key hierarchy: `MasterKey`, `KeySet` (1 or 2 epochs), HKDF sub keys, per-file keys, `DirId`. |
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
-| `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. |
+| `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. |
 | `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids, name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
@@ -164,7 +164,7 @@ shared `Arc<Mutex<OpenFile>>` per real file for all handles, handle table.
 | `inodes` | `InodeTable`: inode ↔ clear path, lookup counts, `forget`, rename of subtrees by range (sorted map). |
 | `xattrs` | In-memory xattrs per clear path (never on disk). 1 MiB per entry, 64 MiB total; values over the limit are accepted but dropped. Linux keeps only `user.*`. |
 | `errno` | `to_errno`: core error → errno (spec section 8 table). |
-| `mount` | `MountRequest`, `mount_and_wait`, `mount_options`, `unmount_command`, `StopReason`. A stop signal tries a normal unmount (`Running::try_unmount`: macOS `unmount(2)`, Linux `fusermount3 -u` without `-z`); if busy, `wait_for_stop` writes the buffers, logs a warning and keeps the drive mounted until the next signal or an outside unmount. |
+| `mount` | `MountRequest`, `mount_and_wait` (starts `start_idle_flusher`: every `IDLE_FLUSH_TICK` 1 s it calls `CryptoFs::flush_idle` with `IDLE_FLUSH_AFTER` 5 s / `MAX_DIRTY_AGE` 30 s; busy files are skipped via `try_lock`), `mount_options`, `unmount_command`, `StopReason`. A stop signal tries a normal unmount (`Running::try_unmount`: macOS `unmount(2)`, Linux `fusermount3 -u` without `-z`); if busy, `wait_for_stop` writes the buffers, logs a warning and keeps the drive mounted until the next signal or an outside unmount. |
 | `macos_mount` | macOS only: mounts through libfuse 2 `fuse_mount()` (fuser's own `fuse_mount_compat25` fails with macFUSE 5.5). `build.rs` adds `/usr/local/lib` or `FUSE_LIB_DIR` to the link path. |
 
 fuser features: macOS `macos-no-mount` + `macfuse-4-compat`; Linux default
@@ -371,7 +371,7 @@ owner to run the mount tests and the smoke test on the Mac (one command per
 block).
 
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
-clean, `cargo test --workspace`: 500 passed, 0 failed, 10 ignored (9 mount
+clean, `cargo test --workspace`: 506 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator).
 
 ## 8. Platform notes
@@ -487,7 +487,9 @@ and "Limits", `docs/format.md` section 8 notes.
   busy drive keeps it mounted instead of leaving a dead mount (smoke test
   step 11 "busy stop", to run on the Mac). `passwd` takes the vault lock (owner decision: race free beats `passwd`
   while mounted). Known gaps documented in README, `docs/format.md` section 8 and the
-  GitHub page. Next: time-based flush of dirty chunks.
+  GitHub page. Time-based flush of dirty chunks done (core + mount thread, container
+  only). Next: caps for hostile input (`.cd-dir` copies, key file slots and
+  size).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;

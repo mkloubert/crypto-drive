@@ -410,6 +410,11 @@ Not protected against:
   also syncs the real directory of its entry, and `fsync` of a directory
   syncs its real directory. A file that is being overwritten during a crash
   can still be left part old and part new.
+- The drive keeps up to 4 MiB of new content per open file in memory. It
+  writes it to the vault when the file is closed or synced, when it is
+  more, about 5 seconds after the last write, and at the latest after
+  about 30 seconds for a file that is written all the time (a log, a VM
+  image). A crash or `kill -9` loses at most these last seconds of changes.
 - Content is changed in place, in chunks of 64 KiB. A crash or power cut in
   the middle of a chunk write can make that whole 64 KiB chunk unreadable
   (it then gives an error), including data in it that was synced before.

@@ -34,6 +34,7 @@ use crate::vault::VaultKeys;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::time::{Duration, Instant};
 
 /// Clean chunks kept in the cache after a flush or a read.
 const MAX_CLEAN_CHUNKS: usize = 8;
@@ -64,6 +65,25 @@ pub struct OpenFile {
     /// without an entry counts as the oldest.
     last_use: HashMap<u64, u64>,
     clock: u64,
+    /// Counts writes; `flush_if_idle` compares it with its last look.
+    changes: u64,
+    /// What `flush_if_idle` saw of the unwritten changes; `None` when there
+    /// are none (or nobody looked yet).
+    idle_watch: Option<IdleWatch>,
+}
+
+/// The view of the idle flush on the unwritten changes of a file. Times are
+/// the times of the looks (ticks of the caller), so writes need no clock.
+#[derive(Clone, Copy, Debug)]
+struct IdleWatch {
+    /// `changes` at the last look.
+    changes: u64,
+    /// The first look that saw unwritten changes.
+    dirty_since: Instant,
+    /// The last look that saw a new write.
+    last_change: Instant,
+    /// After a failed idle flush: no new try before this time.
+    next_try: Option<Instant>,
 }
 
 fn invalid(what: &str) -> Error {
@@ -289,6 +309,8 @@ impl OpenFile {
             dirty: BTreeSet::new(),
             last_use: HashMap::new(),
             clock: 0,
+            changes: 0,
+            idle_watch: None,
         }
     }
 
@@ -444,6 +466,7 @@ impl OpenFile {
             pos = base + stop as u64;
         }
         self.plain_len = self.plain_len.max(end);
+        self.changes = self.changes.wrapping_add(1);
         if self.dirty.len() > Self::MAX_DIRTY_CHUNKS {
             self.flush()?;
         }
@@ -483,6 +506,61 @@ impl OpenFile {
         self.plain_len = len;
     }
 
+    /// True if changes in memory are not on disk yet.
+    fn has_unwritten_changes(&self) -> bool {
+        !self.dirty.is_empty() || self.plain_len != self.disk_len
+    }
+
+    /// Flushes if the unwritten changes have rested for `idle`, or if they
+    /// are older than `max_age` (a file that is written all the time, such
+    /// as a slow log). Returns true if it flushed. Call it at regular
+    /// times (`now` of each call): the time of a change is the time of the
+    /// first call that sees it.
+    ///
+    /// Without this, up to `MAX_DIRTY_CHUNKS` chunks of a file that stays
+    /// open stayed in memory until close or fsync: the vault (and the cloud
+    /// copy) lagged behind, and a kill or a power cut lost them.
+    ///
+    /// After a failed flush the next try comes after `max_age`, so a full
+    /// disk is not tried (and logged) on every call.
+    pub fn flush_if_idle(
+        &mut self,
+        now: Instant,
+        idle: Duration,
+        max_age: Duration,
+    ) -> Result<bool> {
+        if !self.has_unwritten_changes() {
+            self.idle_watch = None;
+            return Ok(false);
+        }
+        let changes = self.changes;
+        let watch = self.idle_watch.get_or_insert(IdleWatch {
+            changes,
+            dirty_since: now,
+            last_change: now,
+            next_try: None,
+        });
+        if watch.changes != changes {
+            watch.changes = changes;
+            watch.last_change = now;
+        }
+        let rested = now.saturating_duration_since(watch.last_change) >= idle;
+        let old = now.saturating_duration_since(watch.dirty_since) >= max_age;
+        let may_try = watch.next_try.is_none_or(|t| now >= t);
+        if !(may_try && (rested || old)) {
+            return Ok(false);
+        }
+        match self.flush() {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                if let Some(w) = self.idle_watch.as_mut() {
+                    w.next_try = Some(now + max_age);
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Writes all dirty chunks and sets the real file size.
     ///
     /// In a padded vault a size change then writes a new size block and
@@ -493,7 +571,7 @@ impl OpenFile {
     /// set back to its old size, so it stays readable; the changes stay in
     /// memory and a later flush tries again.
     pub fn flush(&mut self) -> Result<()> {
-        if self.dirty.is_empty() && self.plain_len == self.disk_len {
+        if !self.has_unwritten_changes() {
             return Ok(());
         }
         self.check_writable()?;
@@ -641,6 +719,7 @@ impl OpenFile {
         }
         self.disk_len = self.plain_len;
         self.dirty.clear();
+        self.idle_watch = None;
         self.trim_cache();
         Ok(())
     }
@@ -672,6 +751,7 @@ mod tests {
     use crate::keys::{KeySet, MasterKey};
     use std::fs::{File, OpenOptions};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     const CS: usize = CHUNK_SIZE as usize;
     const FILE_ID: EntryId = [5; 16];
@@ -1366,5 +1446,75 @@ mod tests {
             assert_eq!(read_all(&mut reopen(&t)), want);
             assert_eq!(disk_len(&t), size(&t, 7 * CHUNK_SIZE + 8));
         });
+    }
+
+    const IDLE: Duration = Duration::from_secs(5);
+    const MAX_AGE: Duration = Duration::from_secs(30);
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn idle_flush_waits_until_writes_stop() {
+        both(|padded| {
+            let t = tmp(padded);
+            let mut f = new_file(&t);
+            let start = Instant::now();
+            f.write(0, b"buffered").unwrap();
+            assert!(!f.flush_if_idle(start + secs(1), IDLE, MAX_AGE).unwrap());
+            assert_eq!(read_all(&mut reopen(&t)), b"");
+            assert!(f.flush_if_idle(start + secs(6), IDLE, MAX_AGE).unwrap());
+            assert_eq!(read_all(&mut reopen(&t)), b"buffered");
+            // Nothing left to write.
+            assert!(!f.flush_if_idle(start + secs(60), IDLE, MAX_AGE).unwrap());
+        });
+    }
+
+    #[test]
+    fn idle_flush_writes_a_file_that_never_rests_after_max_age() {
+        let t = tmp(false);
+        let mut f = new_file(&t);
+        let start = Instant::now();
+        // A slow log: a small append every 2 s, never idle for 5 s.
+        let mut now = start;
+        let mut want = Vec::new();
+        for i in 0..14u8 {
+            now = start + secs(2 * u64::from(i));
+            let line = [b'a' + i, b'\n'];
+            f.write(want.len() as u64, &line).unwrap();
+            want.extend_from_slice(&line);
+            assert!(!f.flush_if_idle(now, IDLE, MAX_AGE).unwrap(), "step {i}");
+        }
+        f.write(want.len() as u64, b"z").unwrap();
+        want.push(b'z');
+        assert!(f.flush_if_idle(now + secs(4), IDLE, MAX_AGE).unwrap());
+        assert_eq!(read_all(&mut reopen(&t)), want);
+    }
+
+    #[test]
+    fn idle_flush_of_a_clean_file_does_nothing() {
+        let t = tmp(false);
+        let mut f = new_file(&t);
+        assert!(
+            !f.flush_if_idle(Instant::now() + secs(100), IDLE, MAX_AGE)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_idle_flush_waits_max_age_before_the_next_try() {
+        let t = tmp(false);
+        let mut f = new_file(&t);
+        let start = Instant::now();
+        f.write(0, b"data").unwrap();
+        assert!(!f.flush_if_idle(start, IDLE, MAX_AGE).unwrap());
+        fail_chunk_writes_after(Some(0));
+        assert!(f.flush_if_idle(start + secs(6), IDLE, MAX_AGE).is_err());
+        fail_chunk_writes_after(None);
+        // No new try every tick: the next one comes after MAX_AGE.
+        assert!(!f.flush_if_idle(start + secs(7), IDLE, MAX_AGE).unwrap());
+        assert!(f.flush_if_idle(start + secs(37), IDLE, MAX_AGE).unwrap());
+        assert_eq!(read_all(&mut reopen(&t)), b"data");
     }
 }
