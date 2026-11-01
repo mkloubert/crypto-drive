@@ -1,0 +1,98 @@
+# crypto-drive
+# Copyright (C) 2026  Marcel Joachim Kloubert
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+[package]
+name = "crypto-drive-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+arbitrary = { version = "1.5.0", features = ["derive"] }
+unicode-normalization = "0.1.26"
+tempfile = "3.27.0"
+crypto-drive-core = { path = "../crates/crypto-drive-core", features = ["test-util"] }
+
+# This is its own workspace, separate from the main one.
+[workspace]
+members = []
+
+[[bin]]
+name = "key_file"
+path = "fuzz_targets/key_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_set"
+path = "fuzz_targets/key_set.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_marker"
+path = "fuzz_targets/vault_marker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_key"
+path = "fuzz_targets/recovery_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "conflict_names"
+path = "fuzz_targets/conflict_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content"
+path = "fuzz_targets/content.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hostile_tree"
+path = "fuzz_targets/hostile_tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fs_ops"
+path = "fuzz_targets/fs_ops.rs"
+test = false
+doc = false
+bench = false

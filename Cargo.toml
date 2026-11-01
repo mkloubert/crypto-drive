@@ -1,0 +1,53 @@
+# crypto-drive
+# Copyright (C) 2026  Marcel Joachim Kloubert
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+[workspace]
+members = ["crates/*"]
+exclude = ["fuzz"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.99"
+
+[workspace.dependencies]
+fuser = { version = "0.18.0", default-features = false }
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+aes-siv = { version = "0.8.0", features = ["zeroize"] }
+argon2 = { version = "0.6.0", features = ["zeroize"] }
+hkdf = "0.13.0"
+hmac = "0.13.0"
+sha2 = "0.11.1"
+subtle = "2.6.1"
+zeroize = "1.9.1"
+secrecy = "0.10.3"
+getrandom = "0.4.3"
+base64 = "0.23.1"
+data-encoding = "2.11.1"
+unicode-normalization = "0.1.26"
+rustix = { version = "=1.1.5", features = ["fs", "mm", "process"] }
+nix = { version = "0.31.3", features = ["process", "signal", "fs", "resource", "mount"] }
+libc = "0.2.191"
+thiserror = "2.0.21"
+clap = { version = "4.6.7", features = ["derive"] }
+rpassword = "7.5.4"
+log = "=0.4.34"
+env_logger = "0.11.11"
+lru = "=0.18.5"
+proptest = "1.12.0"
+tempfile = "3.27.0"
+criterion = "0.8.2"
