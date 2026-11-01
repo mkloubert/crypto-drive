@@ -117,7 +117,7 @@ User docs: `README.md`. Normative format: `docs/format.md`.
 │   ├── kat/gen_vectors.py  independent Python implementation for test vectors
 │   └── diag/               macOS FUSE probes (C) – diagnostics only
 ├── site/                   GitHub Pages project site (see section 10)
-└── .github/workflows/      GitHub Actions (Pages deployment)
+└── .github/workflows/      pages.yml (GitHub Pages), release.yml (binaries on tag vX.Y.Z)
 ```
 
 Not in git (`.gitignore`): `/target`, `.env`, `/c.sh` (local copy timing
@@ -397,10 +397,41 @@ does not repair. Details: README "Threat model" and "Limits".
   HTML/JS check here and ask the owner to look at it locally
   (`python3 -m http.server -d site`).
 
+## 10a. Releases
+
+- `.github/workflows/release.yml` runs on a pushed tag `vX.Y.Z`
+  (for example `v0.1.2`).
+- Job `check`: the tag must equal `v` + the `version` in
+  `crates/crypto-drive/Cargo.toml`, or the run stops. Then fmt, clippy,
+  the header check and `cargo test --workspace --locked`.
+- Job `build` (matrix): `x86_64`/`aarch64-unknown-linux-gnu`,
+  `x86_64`/`aarch64-unknown-linux-musl` (static) on `ubuntu-24.04` /
+  `ubuntu-24.04-arm`, `aarch64-apple-darwin` on `macos-26`,
+  `x86_64-apple-darwin` on `macos-26-intel`. macOS installs macFUSE with
+  brew (link library only). Each target gives
+  `crypto-drive-<tag>-<target>.tar.gz` (binary, LICENSE, README.md,
+  docs/format.md) plus a `.sha256` file.
+- Job `release`: `gh release create` (or `upload --clobber` on a re-run)
+  with `SHA256SUMS` and generated notes. `v0.*` is a pre-release.
+- No Windows or BSD builds: there is no FUSE backend for them.
+- To release: bump `version` in all three `crates/*/Cargo.toml`, update
+  `Cargo.lock` (`cargo build`), commit, then the owner pushes the tag.
+- Rules for workflows: use the latest major version of each action, as a
+  major tag only (`@v7`, not `@v7.0.1`). Look the version up live
+  (`curl -s https://api.github.com/repos/<owner>/<action>/releases/latest`),
+  never from memory. Pin runner images (`ubuntu-24.04`, not
+  `ubuntu-latest`). Prefer the `gh` CLI over third-party actions. Pass
+  `${{ }}` values to `run:` through `env:`.
+- Action versions at the last check (2026-11-01): checkout v7,
+  upload-artifact v7, download-artifact v8, configure-pages v6,
+  upload-pages-artifact v5, deploy-pages v5.
+
 ## 11. Current status (update with every bigger change)
 
-- Branch `feat/mvp` (from `docs/design-spec`), not merged; `main` has no
-  commits; no git remote yet.
+- Git: only `main` (history was squashed into a new start:
+  `6c91912 chore: initial commit`). Remotes: `origin`
+  (github.com/mkloubert/crypto-drive) and `gitea`. No tags yet. Crate
+  version 0.1.0.
 - MVP done: all eight commands, format hardening (entry binding, key epochs,
   `rotate-key`, `recover` with two keys, `--pad-sizes`, name index), fuzzing,
   in-memory xattrs, LRU chunk cache, fsyncdir.

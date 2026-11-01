@@ -1,0 +1,166 @@
+# crypto-drive
+# Copyright (C) 2026  Marcel Joachim Kloubert
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Builds the release binaries when a tag like v0.1.2 is pushed and attaches
+# them to a GitHub release of that tag.
+#
+# - The tag must match the version in crates/crypto-drive/Cargo.toml
+#   (tag v0.1.2 needs version = "0.1.2"), otherwise the run stops.
+# - Supported systems: Linux (x86_64, aarch64; glibc and static musl) and
+#   macOS (Apple Silicon, Intel). Windows and the BSDs have no FUSE backend
+#   in crypto-drive yet.
+# - The Rust version comes from rust-toolchain.toml (rustup reads it).
+# - 0.x versions are marked as pre-release.
+
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tag matches the crate version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -nE 's/^version = "([^"]+)"/\1/p' crates/crypto-drive/Cargo.toml | head -n 1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match crates/crypto-drive/Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Toolchain
+        run: rustup toolchain install
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: License headers
+        run: scripts/check-license-headers.sh
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-26, target: aarch64-apple-darwin }
+          - { os: macos-26-intel, target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain and target
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+
+      # macOS links libfuse 2 from macFUSE (/usr/local/lib). The kernel
+      # extension is not needed to build, only the library.
+      - name: Install macFUSE
+        if: runner.os == 'macOS'
+        run: brew install --cask macfuse
+
+      - name: Build
+        run: cargo build --release --locked -p crypto-drive --target ${{ matrix.target }}
+
+      - name: Smoke check of the binary
+        run: target/${{ matrix.target }}/release/crypto-drive --version
+
+      - name: Package
+        id: package
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="crypto-drive-$TAG-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/crypto-drive" "dist/$name/"
+          strip "dist/$name/crypto-drive" || true
+          cp LICENSE README.md "dist/$name/"
+          mkdir -p "dist/$name/docs"
+          cp docs/format.md "dist/$name/docs/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          pre=""
+          case "$TAG" in v0.*) pre="--prerelease" ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS \
+              --title "crypto-drive $TAG" --generate-notes --verify-tag $pre
+          fi
