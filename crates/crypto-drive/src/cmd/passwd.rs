@@ -49,6 +49,10 @@ pub fn run(args: &PasswdArgs) -> Result<(), CliError> {
     }
     let path = super::require_vault_and_key_file(&args.vault_dir, args.key_file.as_deref())?;
     let params = args.argon2.params()?;
+    // Held until the new key file is written: `rotate-key` and `recover`
+    // take the same lock, so neither can write a key set that this command
+    // would then replace with the old one. Fails fast, before any prompt.
+    let _lock = super::lock_vault_for_key_change(&args.vault_dir)?;
     let old = read_password(
         &PasswordArgs {
             fd: args.password_fd,

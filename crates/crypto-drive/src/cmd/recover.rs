@@ -24,9 +24,7 @@ use crypto_drive_core::error::Error;
 use crypto_drive_core::keyfile::KeyFile;
 use crypto_drive_core::keys::KeySet;
 use crypto_drive_core::recovery::decode_recovery_key;
-use crypto_drive_core::vault::{
-    lock_vault, open_with_master_key, rotation_unfinished, verify_next_key,
-};
+use crypto_drive_core::vault::{open_with_master_key, rotation_unfinished, verify_next_key};
 use secrecy::ExposeSecret;
 
 use super::Argon2Args;
@@ -92,15 +90,7 @@ pub fn run(args: &RecoverArgs) -> Result<(), CliError> {
     let mk = decode_recovery_key(text.expose_secret())?;
     // The decision below depends on the state of the tree, so no mount or
     // rotation may change it before the key file is written.
-    let _lock = match lock_vault(&args.vault_dir) {
-        Ok(lock) => lock,
-        Err(Error::AlreadyMounted) => {
-            return Err(CliError::Usage(
-                "the vault is in use (mounted, or a key rotation runs); stop it first".into(),
-            ));
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let _lock = super::lock_vault_for_key_change(&args.vault_dir)?;
     // Checks the vault tag, so a key of another vault is refused.
     let vault = match open_with_master_key(&args.vault_dir, &mk) {
         Ok(vault) => vault,

@@ -118,7 +118,7 @@ Other commands:
 
 | Command | What it does |
 |---|---|
-| `passwd <vault>` | Change the password. The master key stays the same. |
+| `passwd <vault>` | Change the password. The master key stays the same. The vault must not be mounted. |
 | `rotate-key <vault>` | Replace the master key and re-encrypt the whole vault (see "Key rotation"). |
 | `recovery-key <vault>` | Print the recovery key again (of the vault's current key). |
 | `recover <vault>` | Write a new key file from the recovery key (`--overwrite` to replace one). |
@@ -135,6 +135,9 @@ Other commands:
 - `recover` reads the recovery key from `--recovery-key-fd N` or the terminal,
   and the second key of an unfinished rotation from `--new-recovery-key-fd N`
   or the terminal. The vault must not be mounted while `recover` runs.
+- `passwd`, `recover` and `rotate-key` refuse a vault that is mounted or in
+  a key rotation. They take the vault lock, so they never run beside each
+  other and never write over each other's key file.
 - `--password-fd` and `--new-password-fd` must be different descriptors.
 - Environment variables are less safe (other programs can read them). A
   warning is printed. Prefer a file descriptor:

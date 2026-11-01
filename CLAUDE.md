@@ -190,7 +190,9 @@ fuser features: macOS `macos-no-mount` + `macfuse-4-compat`; Linux default
   fork before any thread, status pipe, `setsid`, stdio to `/dev/null`;
   SIGINT/SIGTERM/SIGHUP unmount cleanly, a busy drive stays mounted; a dead
   mount point (ENOTCONN / ENXIO) gets an `unmount --force` hint), `unmount`, `passwd`, `rotate-key`,
-  `recovery-key`, `recover`, `check`.
+  `recovery-key`, `recover`, `check`. `passwd` and `recover` take the vault
+  lock through `cmd::lock_vault_for_key_change` (message `VAULT_IN_USE`), like
+  `rotate-key` and `mount`, so key file writers never run side by side.
 
 Environment variables: `CRYPTO_DRIVE_PASSWORD`, `CRYPTO_DRIVE_NEW_PASSWORD`,
 `RUST_LOG`; tests/scripts: `CRYPTO_DRIVE_BIN`, `CRYPTO_DRIVE_TEST_MOUNT_OPTS`,
@@ -369,7 +371,7 @@ owner to run the mount tests and the smoke test on the Mac (one command per
 block).
 
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
-clean, `cargo test --workspace`: 499 passed, 0 failed, 10 ignored (9 mount
+clean, `cargo test --workspace`: 500 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator).
 
 ## 8. Platform notes
@@ -476,7 +478,9 @@ does not repair. Details: README "Threat model" and "Limits".
   first, so `cp -p` / copyfile keep the mtime (new mount test
   `mtime_set_before_close_is_kept`, to run on the Mac); a stop signal with a
   busy drive keeps it mounted instead of leaving a dead mount (smoke test
-  step 11 "busy stop", to run on the Mac). Next: `lock_vault` in `passwd`.
+  step 11 "busy stop", to run on the Mac). `passwd` takes the vault lock (owner decision: race free beats `passwd`
+  while mounted). Next: document the known gaps (README threat model and
+  limits).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;

@@ -177,6 +177,30 @@ fn passwd_changes_the_password() {
     assert_eq!(check(&vault, "new\n", &[]).status.code(), Some(0));
 }
 
+/// `passwd` must not run beside `rotate-key` or `recover`: it would write
+/// the old key set over the one they wrote (review 2026-11-01). They hold
+/// the vault lock; so does a mount.
+#[test]
+fn passwd_refuses_a_vault_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("v");
+    init(&vault, "old\n", &[]);
+    let lock = crypto_drive_core::vault::lock_vault(&vault).unwrap();
+    let mut args = vec!["passwd", vault.to_str().unwrap(), "--new-password-fd", "0"];
+    args.extend(FAST);
+    let out = run(&args, "new\n", &[("CRYPTO_DRIVE_PASSWORD", "old")]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr(&out)
+            .contains("the vault is in use (mounted, or a key rotation runs); stop it first"),
+        "{}",
+        stderr(&out)
+    );
+    drop(lock);
+    assert_eq!(check(&vault, "old\n", &[]).status.code(), Some(0));
+    assert_eq!(check(&vault, "new\n", &[]).status.code(), Some(2));
+}
+
 #[test]
 fn recovery_key_matches_init() {
     let dir = tempfile::tempdir().unwrap();

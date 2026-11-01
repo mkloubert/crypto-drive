@@ -28,12 +28,28 @@ pub mod unmount;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crypto_drive_core::error::Error;
 use crypto_drive_core::keyfile::Argon2Params;
-use crypto_drive_core::vault::VAULT_FILE;
+use crypto_drive_core::vault::{VAULT_FILE, VaultLock, lock_vault};
 use zeroize::Zeroizing;
 
 use crate::CliError;
 use crate::keypath::{NO_KEY_FILE, existing_key_file};
+
+/// Takes the vault lock for a command that changes the key file
+/// (`passwd`, `recover`). A mount and `rotate-key` hold the same lock, so
+/// the command never writes over a key set that a rotation just wrote.
+pub(crate) fn lock_vault_for_key_change(vault_dir: &Path) -> Result<VaultLock, CliError> {
+    match lock_vault(vault_dir) {
+        Ok(lock) => Ok(lock),
+        Err(Error::AlreadyMounted) => Err(CliError::Usage(VAULT_IN_USE.into())),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The message when the vault lock is held by a mount or a rotation.
+pub(crate) const VAULT_IN_USE: &str =
+    "the vault is in use (mounted, or a key rotation runs); stop it first";
 
 /// Argon2 flags shared by `init`, `passwd` and `recover`.
 #[derive(clap::Args, Debug)]
