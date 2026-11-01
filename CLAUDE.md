@@ -292,7 +292,8 @@ Check: `scripts/check-license-headers.sh`.
   in-memory model, also after reopen), `rotate.rs` (crash after every write
   step), `fd_limit.rs` (lowers the process open-file limit, so it must stay
   the only test in its binary). CLI: `crates/crypto-drive/tests/cli.rs`. Mount: 
-  `crates/crypto-drive-fuse/tests/mount.rs` (`#[ignore = "needs FUSE"]`).
+  `crates/crypto-drive-fuse/tests/mount.rs` (`#[ignore = "needs FUSE"]`;
+  checks behind the kernel through the shared `CryptoFs` in `Mounted::fs`).
 - A bug fix gets a test that fails without the fix (TDD is the usual way of
   work in this project).
 - CLI tests feed stdin through `write_input()` in `tests/cli.rs`, which
@@ -365,7 +366,7 @@ owner to run the mount tests and the smoke test on the Mac (one command per
 block).
 
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
-clean, `cargo test --workspace`: 489 passed, 0 failed, 9 ignored (8 mount
+clean, `cargo test --workspace`: 493 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator).
 
 ## 8. Platform notes
@@ -466,9 +467,12 @@ does not repair. Details: README "Threat model" and "Limits".
   in-memory xattrs, LRU chunk cache, fsyncdir.
 - Verified by the owner on macOS 26.6.2 + macFUSE 5.5.0: all tests, real
   mount tests, smoke test, Finder copies.
-- Review 2026-11-01: open-file limit fixed (CLI raises `RLIMIT_NOFILE`,
-  core sizes the directory cache from it), Linux container tested only, not
-  yet committed. Next: keep the mtime across the close flush (`cp -p`).
+- Review 2026-11-01, Linux container tested only, not yet committed:
+  open-file limit fixed (CLI raises `RLIMIT_NOFILE`, core sizes the
+  directory cache from it); `set_times` on an open file flushes its buffer
+  first, so `cp -p` / copyfile keep the mtime (new mount test
+  `mtime_set_before_close_is_kept`, to run on the Mac). Next: do not leave a
+  dead mount when a stop signal meets a busy drive.
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;
