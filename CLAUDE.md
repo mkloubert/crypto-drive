@@ -290,6 +290,11 @@ Check: `scripts/check-license-headers.sh`.
   `crates/crypto-drive-fuse/tests/mount.rs` (`#[ignore = "needs FUSE"]`).
 - A bug fix gets a test that fails without the fix (TDD is the usual way of
   work in this project).
+- CLI tests feed stdin through `write_input()` in `tests/cli.rs`, which
+  accepts a broken pipe (a command that fails early does not read its
+  input). Fast CI runners hit this race; never `unwrap()` a stdin write.
+- CI (GitHub runners) is faster than the container: timing races show up
+  there first. Run a suspect test in a loop locally before saying it is fine.
 - Fuzz targets in `fuzz/fuzz_targets/` (see README "Fuzzing"). A new parser
   gets a fuzz target and seeds in `fuzz/seeds.sh`.
 
@@ -302,7 +307,15 @@ Check: `scripts/check-license-headers.sh`.
 | Threat model / known gap | `README.md` "Threat model" / "Limits", `docs/format.md` |
 | Deferred finding | `docs/superpowers/plans/2026-10-31-crypto-drive-mvp-followups.md` |
 | Structure, commands, conventions, status | `CLAUDE-new.md` (see 0.1) |
-| User-facing features | `site/index.html` (GitHub page) |
+| Anything a visitor of the project page cares about (see below) | `site/index.html` (GitHub page, section 10) |
+
+GitHub page rule: after every change, ask "does a visitor of
+<https://mkloubert.github.io/crypto-drive/> need to know this?" If yes,
+update `site/index.html` in the same piece of work and say so to the owner.
+Relevant: new or removed commands and flags, install steps, supported
+systems and release downloads, threat model and limits, status (pre-release,
+audit), big user-visible features. Not relevant: internal refactors, tests,
+CI internals, small fixes. If unsure, ask the owner.
 
 ### 6.5 Workflow
 
@@ -347,7 +360,7 @@ owner to run the mount tests and the smoke test on the Mac (one command per
 block).
 
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
-clean, `cargo test --workspace`: 482 passed, 0 failed, 9 ignored (8 mount
+clean, `cargo test --workspace`: 483 passed, 0 failed, 9 ignored (8 mount
 tests + the golden generator).
 
 ## 8. Platform notes
@@ -430,7 +443,8 @@ does not repair. Details: README "Threat model" and "Limits".
 
 - Git: only `main` (history was squashed into a new start:
   `6c91912 chore: initial commit`). Remotes: `origin`
-  (github.com/mkloubert/crypto-drive) and `gitea`. No tags yet. Crate
+  (github.com/mkloubert/crypto-drive) and `gitea`. Tag `v0.1.0` exists; its
+  first release run failed on a CLI test race (fixed in the test helper). Crate
   version 0.1.0.
 - MVP done: all eight commands, format hardening (entry binding, key epochs,
   `rotate-key`, `recover` with two keys, `--pad-sizes`, name index), fuzzing,

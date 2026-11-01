@@ -48,13 +48,29 @@ fn run(args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    write_input(&mut child, stdin);
     child.wait_with_output().unwrap()
+}
+
+/// Writes `stdin` to the child and closes its input. A command that fails
+/// early (for example "add --yes") exits without reading its input, so the
+/// write can hit a closed pipe. That is fine: the tests check the exit code
+/// and the output.
+fn write_input(child: &mut std::process::Child, stdin: &str) {
+    let mut input = child.stdin.take().unwrap();
+    match input.write_all(stdin.as_bytes()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        other => other.unwrap(),
+    }
+}
+
+/// The helper must accept a child that exits without reading its input.
+/// 1 MiB is more than a pipe buffer, so the write always hits the closed
+/// pipe; with a small input this only happens when the child is fast.
+#[test]
+fn run_accepts_a_child_that_does_not_read_its_input() {
+    let out = run(&["--version"], &"x".repeat(1 << 20), &[]);
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// `init` with the key file `.cd-key` inside the vault (the old layout,
@@ -795,12 +811,7 @@ fn run_with_closed_stdout(args: &[&str], stdin: &str) -> Output {
         .spawn()
         .unwrap();
     drop(child.stdout.take());
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    write_input(&mut child, stdin);
     child.wait_with_output().unwrap()
 }
 
