@@ -17,8 +17,9 @@
 # Builds the release binaries when a tag like v0.1.2 is pushed and attaches
 # them to a GitHub release of that tag.
 #
-# - The tag must match the version in crates/crypto-drive/Cargo.toml
-#   (tag v0.1.2 needs version = "0.1.2"), otherwise the run stops.
+# - The tag is the single source of truth for the version: every job runs
+#   scripts/set-version.sh with it before it builds (Cargo.toml and
+#   Cargo.lock in the repository only hold a placeholder).
 # - Supported systems: Linux (x86_64, aarch64; glibc and static musl) and
 #   macOS (Apple Silicon, Intel). Windows and the BSDs have no FUSE backend
 #   in crypto-drive yet.
@@ -48,15 +49,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Tag matches the crate version
+      - name: Version from the tag
         env:
           TAG: ${{ github.ref_name }}
-        run: |
-          version=$(sed -nE 's/^version = "([^"]+)"/\1/p' crates/crypto-drive/Cargo.toml | head -n 1)
-          if [ "v$version" != "$TAG" ]; then
-            echo "::error::tag $TAG does not match crates/crypto-drive/Cargo.toml version $version"
-            exit 1
-          fi
+        run: scripts/set-version.sh "$TAG"
 
       - name: Toolchain
         run: rustup toolchain install
@@ -90,6 +86,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Version from the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: scripts/set-version.sh "$TAG"
+
       - name: Toolchain and target
         run: |
           rustup toolchain install
@@ -105,7 +106,16 @@ jobs:
         run: cargo build --release --locked -p crypto-drive --target ${{ matrix.target }}
 
       - name: Smoke check of the binary
-        run: target/${{ matrix.target }}/release/crypto-drive --version
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          out=$("target/$TARGET/release/crypto-drive" --version)
+          echo "$out"
+          if [ "$out" != "crypto-drive ${TAG#v}" ]; then
+            echo "::error::binary reports '$out', expected 'crypto-drive ${TAG#v}'"
+            exit 1
+          fi
 
       - name: Package
         id: package

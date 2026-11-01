@@ -112,6 +112,7 @@ User docs: `README.md`. Normative format: `docs/format.md`.
 ├── fuzz/                   cargo-fuzz crate, own workspace, pinned nightly
 ├── scripts/
 │   ├── check-license-headers.sh
+│   ├── set-version.sh      sets the crate version (release workflow, from the tag)
 │   ├── smoke-test.sh       real-mount end-to-end test (needs FUSE + release build)
 │   ├── fuzz.sh             runs fuzz targets
 │   ├── kat/gen_vectors.py  independent Python implementation for test vectors
@@ -414,21 +415,29 @@ does not repair. Details: README "Threat model" and "Limits".
 
 - `.github/workflows/release.yml` runs on a pushed tag `vX.Y.Z`
   (for example `v0.1.2`).
-- Job `check`: the tag must equal `v` + the `version` in
-  `crates/crypto-drive/Cargo.toml`, or the run stops. Then fmt, clippy,
-  the header check and `cargo test --workspace --locked`.
+- The git tag is the single source of truth for the version. The repository
+  holds only the placeholder `version = "0.0.0"` in `[workspace.package]`
+  of the root `Cargo.toml`; the crates use `version.workspace = true`.
+  Never bump the version by hand and never commit a real version.
+- `scripts/set-version.sh <X.Y.Z|vX.Y.Z>` writes the version into
+  `Cargo.toml` and into the three workspace entries of `Cargo.lock` (perl,
+  no network), so `--locked` builds keep working. Every CI job runs it with
+  the tag first. Local builds report `crypto-drive 0.0.0`.
+- Job `check`: set the version, then fmt, clippy, the header check and
+  `cargo test --workspace --locked`.
 - Job `build` (matrix): `x86_64`/`aarch64-unknown-linux-gnu`,
   `x86_64`/`aarch64-unknown-linux-musl` (static) on `ubuntu-24.04` /
   `ubuntu-24.04-arm`, `aarch64-apple-darwin` on `macos-26`,
   `x86_64-apple-darwin` on `macos-26-intel`. macOS installs macFUSE with
   brew (link library only). Each target gives
   `crypto-drive-<tag>-<target>.tar.gz` (binary, LICENSE, README.md,
-  docs/format.md) plus a `.sha256` file.
+  docs/format.md) plus a `.sha256` file. A smoke step fails if
+  `crypto-drive --version` is not `crypto-drive <tag without v>`.
 - Job `release`: `gh release create` (or `upload --clobber` on a re-run)
   with `SHA256SUMS` and generated notes. `v0.*` is a pre-release.
 - No Windows or BSD builds: there is no FUSE backend for them.
-- To release: bump `version` in all three `crates/*/Cargo.toml`, update
-  `Cargo.lock` (`cargo build`), commit, then the owner pushes the tag.
+- To release: the owner creates and pushes the tag (`git tag vX.Y.Z`,
+  `git push origin vX.Y.Z`). Nothing has to change in the repository.
 - Rules for workflows: use the latest major version of each action, as a
   major tag only (`@v7`, not `@v7.0.1`). Look the version up live
   (`curl -s https://api.github.com/repos/<owner>/<action>/releases/latest`),
@@ -443,9 +452,10 @@ does not repair. Details: README "Threat model" and "Limits".
 
 - Git: only `main` (history was squashed into a new start:
   `6c91912 chore: initial commit`). Remotes: `origin`
-  (github.com/mkloubert/crypto-drive) and `gitea`. Tag `v0.1.0` exists; its
-  first release run failed on a CLI test race (fixed in the test helper). Crate
-  version 0.1.0.
+  (github.com/mkloubert/crypto-drive) and `gitea`. Tags `v0.1.0` (first run failed
+  on a CLI test race, fixed in the test helper) and `v0.1.1` (failed on the old
+  tag/version check, replaced by the tag-driven version). Repository version
+  placeholder: 0.0.0.
 - MVP done: all eight commands, format hardening (entry binding, key epochs,
   `rotate-key`, `recover` with two keys, `--pad-sizes`, name index), fuzzing,
   in-memory xattrs, LRU chunk cache, fsyncdir.
