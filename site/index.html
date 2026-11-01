@@ -426,6 +426,9 @@
               <li>Number of files and directories</li>
               <li>Tree shape and nesting depth</li>
               <li>Timestamps and times of changes</li>
+              <li>Exact length of every name</li>
+              <li>Which file is which over time (file and directory ids stay the same across renames and key rotation)</li>
+              <li>Which 64 KiB parts of a file changed</li>
             </ul>
           </div>
           <div class="reveal card p-6">
@@ -433,6 +436,7 @@
             <ul class="mt-4 space-y-3 text-sm text-ash">
               <li>Malware or root on the running, unlocked system</li>
               <li>Rollback of a single file to an older version</li>
+              <li>Deleted files, or deleted files brought back</li>
               <li>Mixing old and new chunks of the same file</li>
               <li>Moves between directories with a planted <span class="font-mono text-paper">.cd-dir</span> copy (logged and reported by <span class="font-mono text-paper">check</span>)</li>
               <li>Copies of old ciphertext together with an old key</li>
@@ -442,7 +446,7 @@
 
         <div class="reveal mt-10 rounded-2xl border border-ember/25 bg-ember/[0.06] p-6 text-sm leading-relaxed text-ash">
           <p><span class="font-mono text-xs uppercase tracking-[0.18em] text-ember-soft">Status</span></p>
-          <p class="mt-2"><strong class="font-medium text-paper">crypto-drive is pre-release software.</strong> The on-disk format is frozen (version 1, with golden test vaults and known-answer tests), but there has been no external security audit yet. Keep backups of important data. Not supported yet: symlinks, hard links, persistent extended attributes, a GUI and Windows.</p>
+          <p class="mt-2"><strong class="font-medium text-paper">crypto-drive is pre-release software.</strong> The on-disk format is frozen (version 1, with golden test vaults and known-answer tests), but there has been no external security audit yet. Keep backups of important data. A power cut during a write can make a 64 KiB part of a file unreadable, so databases and VM images are better kept outside the drive. On macOS the drive serves one request at a time and reports itself as case-insensitive (it is case sensitive). Not supported yet: symlinks, hard links, persistent extended attributes, a GUI and Windows.</p>
         </div>
       </div>
     </section>

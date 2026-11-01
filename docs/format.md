@@ -293,6 +293,21 @@ version of a file, or of a name, because there is no write counter and no
 local state. A rotation (section 11) makes old versions unreadable only if
 they were encrypted under a removed epoch.
 
+Non-normative notes on what format version 1 does not hide or detect:
+
+- No directory listing is authenticated. Removing entries, or putting back
+  a deleted entry (an older valid real name with its content), is not
+  detected.
+- The length of a real name gives the exact byte length of the NFC clear
+  name (section 6); for a long name, the size of `.cd-name` gives it.
+- `file_id` (section 7) and the directory id (section 5) are stored in clear
+  and are kept by renames, moves and rotations, so copies of a vault taken
+  at different times can be linked entry by entry.
+- AES-SIV is deterministic: the same parent directory id, entry id and name
+  give the same real name, so renaming an entry back gives its old real name.
+- A chunk is rewritten in place with a new nonce; which chunk indexes
+  changed between two copies of a file is visible.
+
 ## 9. Directory rules
 
 - A directory is empty when it holds only control files. Any other entry,

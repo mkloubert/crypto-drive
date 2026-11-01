@@ -392,7 +392,14 @@ No rollback detection; chunk mixing between versions of the same file is
 not detected; an extra `.cd-dir` copy allows undetected moves between
 directories (warning + `check` finding `multiple-dir-ids`); xattrs in memory
 only; no symlinks / hard links / chown; rename replace is not atomic; `check`
-does not repair. Details: README "Threat model" and "Limits".
+does not repair; deleting or bringing back entries is not detected; visible
+metadata: exact name length, clear file / dir ids (stable across rename,
+move and rotation), deterministic names, changed chunk positions; a crash
+during a chunk write can make the whole 64 KiB chunk unreadable (databases,
+VM images at risk); macOS: one FUSE thread, the volume reports
+case-insensitive (fuser sets `FUSE_CASE_INSENSITIVE`, not removable in
+0.18); inode numbers change on each mount. Details: README "Threat model"
+and "Limits", `docs/format.md` section 8 notes.
 
 ## 10. GitHub Pages site
 
@@ -479,8 +486,8 @@ does not repair. Details: README "Threat model" and "Limits".
   `mtime_set_before_close_is_kept`, to run on the Mac); a stop signal with a
   busy drive keeps it mounted instead of leaving a dead mount (smoke test
   step 11 "busy stop", to run on the Mac). `passwd` takes the vault lock (owner decision: race free beats `passwd`
-  while mounted). Next: document the known gaps (README threat model and
-  limits).
+  while mounted). Known gaps documented in README, `docs/format.md` section 8 and the
+  GitHub page. Next: time-based flush of dirty chunks.
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;

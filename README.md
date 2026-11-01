@@ -302,6 +302,21 @@ and timestamps and times of changes. With `--pad-sizes` the exact size is
 hidden, but the size stage, the number of files, the tree shape and the
 timestamps stay visible.
 
+Also visible, with and without `--pad-sizes`:
+
+- The exact length of every name (in bytes, after Unicode NFC). The length
+  of the encrypted name follows from it; a long name shows it through the
+  size of its `.cd-name` file.
+- Which file is which over time. The file id (in the file header) and the
+  directory id (`.cd-dir`) are stored in clear and stay the same after a
+  rename, a move and a key rotation. Someone who keeps copies of the vault
+  can follow a file or a directory through all of these.
+- Renaming back. A file renamed from A to B and back to A in the same
+  directory gets the same encrypted name as before.
+- Which parts of a file changed. A write into an existing file rewrites
+  only the 64 KiB chunks it touches, so the positions of such edits are
+  visible. (Apps that save a new copy and rename it rewrite the whole file.)
+
 Not protected against:
 
 - An attacker on the running, unlocked system (malware, root, the same user
@@ -325,6 +340,9 @@ Not protected against:
   for such a directory (once per mount), and `check` reports it as
   `multiple-dir-ids`. If you did not expect a sync conflict there, look at
   the entries of that directory.
+- Deleting entries, or bringing back deleted ones. No directory listing is
+  authenticated: someone who can change the vault can remove single files or
+  whole directories, or put back an old, deleted file. Nothing reports it.
 - Past leaks. `rotate-key` makes old key files, old passwords and old recovery
   keys useless for the vault as it is afterwards. It cannot take back a copy
   of old ciphertext plus an old key that someone already has. Until you run
@@ -352,7 +370,21 @@ Not protected against:
   their in-memory xattrs under the old name until the unmount.
 - Finder writes `.DS_Store` files (view settings) into the drive. They are
   stored encrypted like any other file.
-- Names are case sensitive.
+- Names are case sensitive. On macOS the drive still tells the system that
+  it is not case sensitive (the FUSE library sets this flag, and it cannot be
+  turned off yet). Apps that ask for this, such as Finder, may treat `README`
+  and `Readme` as the same name. On macOS, avoid names that differ only in
+  case.
+- macOS serves all requests of the drive one after another (one thread;
+  Linux uses four). A big copy or a slow operation makes other apps wait.
+  If the vault is in a cloud folder with "online only" or "optimize
+  storage" files (iCloud Drive, Dropbox, OneDrive), the first access to such
+  a file downloads it, and the drive waits for the download.
+- Inode numbers are not stable: a file gets a new inode number after every
+  mount. Tools that compare inode numbers do more work after a mount: `git
+  status` reads every file again (`git config core.checkStat minimal` helps),
+  and backup tools with a file cache (borg, restic) read all files again.
+  The drive cannot be exported over NFS.
 - File sizes, counts, tree shape and timestamps are visible (see above).
 - Rollback of single files is not detected.
 - Old key files keep working after `passwd` (use `rotate-key`).
@@ -378,6 +410,13 @@ Not protected against:
   also syncs the real directory of its entry, and `fsync` of a directory
   syncs its real directory. A file that is being overwritten during a crash
   can still be left part old and part new.
+- Content is changed in place, in chunks of 64 KiB. A crash or power cut in
+  the middle of a chunk write can make that whole 64 KiB chunk unreadable
+  (it then gives an error), including data in it that was synced before.
+  Databases (SQLite and others) and VM images write small parts of big
+  files and expect older synced data to survive a crash; their own recovery
+  cannot repair such a chunk. Keep backups, and prefer to keep such files
+  outside the drive.
 - If two entries in a directory have the same clear name, it is not defined
   which one gets the plain name. The other shows as `(conflict N)`.
 - An unreadable long-name entry is hidden from the listing and blocks creating
