@@ -164,6 +164,33 @@ impl CryptoFs {
         Ok(attr(&st, FileKind::File, len))
     }
 
+    /// Writes the buffered changes of the file entry `entry` if it is open,
+    /// then runs `f` while the open file stays locked. The flush at close
+    /// then has nothing left to write, so what `f` sets on the real file
+    /// stays. `cp -p`, `cp -a` and macOS copyfile set the times while the
+    /// copy is still open; without this the close flush moved the mtime to
+    /// "now".
+    pub(super) fn with_flushed_file<T>(
+        &self,
+        parent: &DirState,
+        entry: &EntryRef,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let loc = self.locate(parent, entry)?;
+        let st = loc.dir.stat(&loc.name)?;
+        let shared = if st.kind == Kind::File {
+            self.live((st.dev, st.ino))
+        } else {
+            None
+        };
+        let Some(shared) = shared else {
+            return f();
+        };
+        let mut open = lock(&shared);
+        open.flush()?;
+        f()
+    }
+
     /// Uses `shared`. If it can only read and `file` can write the same real
     /// file, `file` takes its place.
     fn adopt(&self, shared: Shared, file: std::fs::File, writable: bool) -> Result<Shared> {

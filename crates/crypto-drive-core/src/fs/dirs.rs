@@ -288,7 +288,8 @@ impl CryptoFs {
     }
 
     /// Sets times; `None` leaves that time unchanged. Long files act on
-    /// `.cd-content`.
+    /// `.cd-content`. An open file first writes its buffered changes, so
+    /// the flush at close does not move the new mtime to "now".
     pub fn set_times(
         &self,
         path: &VPath,
@@ -297,11 +298,19 @@ impl CryptoFs {
     ) -> Result<()> {
         match self.resolve(path)? {
             None => self.root.set_times_self(atime, mtime),
-            Some((parent, _, entry)) if entry.layout == Layout::LongFile => parent
-                .handle
-                .open_dir(&entry.real)?
-                .set_times(CONTENT_FILE, atime, mtime),
-            Some((parent, _, entry)) => parent.handle.set_times(&entry.real, atime, mtime),
+            Some((parent, _, entry)) if entry.layout.is_dir() => {
+                parent.handle.set_times(&entry.real, atime, mtime)
+            }
+            Some((parent, _, entry)) => self.with_flushed_file(&parent, &entry, || {
+                if entry.layout == Layout::LongFile {
+                    parent
+                        .handle
+                        .open_dir(&entry.real)?
+                        .set_times(CONTENT_FILE, atime, mtime)
+                } else {
+                    parent.handle.set_times(&entry.real, atime, mtime)
+                }
+            }),
         }
     }
 
@@ -340,7 +349,7 @@ mod tests {
     use crate::Error;
     use crate::keys::MasterKey;
     use crate::names::LONG_PREFIX;
-    use crate::testutil::{test_vault, test_vault_with};
+    use crate::testutil::{test_vault, test_vault_padded, test_vault_with};
     use crate::vault::{CONTROL_PREFIX, UnlockedVault};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
@@ -498,6 +507,50 @@ mod tests {
         f.fs.set_times(&p("a"), Some(t2), None).unwrap();
         let st = f.fs.getattr(&p("a")).unwrap();
         assert_eq!((st.atime, st.mtime), (t2, t));
+    }
+
+    /// `cp -p`, `cp -a` and macOS copyfile set the times while the copy is
+    /// still open. The data written before must not move the mtime to
+    /// "now" when it is flushed at close.
+    fn assert_mtime_kept_across_close(f: &Fx, name: &str) {
+        let data = vec![7u8; 3 * 65536 + 100];
+        let (_, h) = f.fs.create(&p(name), 0o644).unwrap();
+        f.fs.write(h, 0, &data).unwrap();
+        let t = UNIX_EPOCH + Duration::from_secs(946_684_800);
+        f.fs.set_times(&p(name), Some(t), Some(t)).unwrap();
+        f.fs.release(h).unwrap();
+        let st = f.fs.getattr(&p(name)).unwrap();
+        assert_eq!((st.mtime, st.size), (t, data.len() as u64));
+        let h = f.fs.open(&p(name), false, false).unwrap();
+        assert_eq!(f.fs.read(h, 0, data.len() as u32 + 10).unwrap(), data);
+        f.fs.release(h).unwrap();
+    }
+
+    #[test]
+    fn set_times_on_an_open_file_survives_close() {
+        assert_mtime_kept_across_close(&fx(), "copy.bin");
+    }
+
+    #[test]
+    fn set_times_on_an_open_long_name_file_survives_close() {
+        assert_mtime_kept_across_close(&fx_from(test_vault_with(64)), &"l".repeat(120));
+    }
+
+    #[test]
+    fn set_times_on_an_open_padded_file_survives_close() {
+        assert_mtime_kept_across_close(&fx_from(test_vault_padded()), "copy.bin");
+    }
+
+    #[test]
+    fn write_after_set_times_moves_the_mtime_again() {
+        let f = fx();
+        let (_, h) = f.fs.create(&p("a"), 0o644).unwrap();
+        f.fs.write(h, 0, b"one").unwrap();
+        let t = UNIX_EPOCH + Duration::from_secs(946_684_800);
+        f.fs.set_times(&p("a"), None, Some(t)).unwrap();
+        f.fs.write(h, 3, b"two").unwrap();
+        f.fs.release(h).unwrap();
+        assert!(f.fs.getattr(&p("a")).unwrap().mtime > t);
     }
 
     #[test]

@@ -17,7 +17,7 @@
 //! Real mount tests. They need FUSE, so they are ignored by default; run
 //! them with `cargo test -p crypto-drive-fuse -- --ignored`.
 
-use crypto_drive_core::fs::CryptoFs;
+use crypto_drive_core::fs::{CryptoFs, VPath};
 use crypto_drive_core::testutil::test_vault;
 use crypto_drive_fuse::{MountRequest, StopReason, mount_and_wait, unmount_command};
 use std::fs::{self, OpenOptions};
@@ -243,6 +243,55 @@ fn run_ok(cmd: &mut std::process::Command) {
         "{cmd:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// A time set on the open file (futimens before close, as `cp -p` and
+/// macOS copyfile do) must survive the close. The mtime is read from the
+/// drive behind the kernel, so a cached attribute cannot hide a change.
+#[test]
+#[ignore = "needs FUSE"]
+fn mtime_set_before_close_is_kept() {
+    let Some(m) = Mounted::new() else { return };
+    let t = std::time::UNIX_EPOCH + Duration::from_secs(946_684_800);
+    let data = pattern(300_000);
+    let mut f = fs::File::create(m.mountpoint.join("fd.bin")).unwrap();
+    f.write_all(&data).unwrap();
+    f.set_modified(t).unwrap();
+    drop(f);
+
+    let src_dir = TempDir::new().unwrap();
+    let src = src_dir.path().join("src.bin");
+    fs::write(&src, &data).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&src)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut names = vec!["fd.bin", "cp.bin"];
+    run_ok(
+        std::process::Command::new("cp")
+            .arg("-p")
+            .arg(&src)
+            .arg(m.mountpoint.join("cp.bin")),
+    );
+    #[cfg(target_os = "macos")]
+    {
+        run_ok(
+            std::process::Command::new("ditto")
+                .arg(&src)
+                .arg(m.mountpoint.join("ditto.bin")),
+        );
+        names.push("ditto.bin");
+    }
+    for name in names {
+        let path = VPath::parse(&format!("/{name}")).unwrap();
+        let attr = m.fs.getattr(&path).unwrap();
+        assert_eq!((attr.mtime, attr.size), (t, data.len() as u64), "{name}");
+        assert_eq!(fs::read(m.mountpoint.join(name)).unwrap(), data, "{name}");
+    }
+    m.unmount();
 }
 
 /// Copy tools must not fail on a source file with extended attributes
