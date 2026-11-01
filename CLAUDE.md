@@ -1,8 +1,8 @@
 # CLAUDE.md – crypto-drive
 
 Guide for Claude Code sessions in this repository. Read it fully at the start
-of every session. Last full project scan: 2026-11-01 (branch `feat/mvp`,
-commit `8932fc4`).
+of every session. Last full project scan: 2026-11-01 (branch `main`,
+commit `34a0dee`, plus the open-file limit work).
 
 ## 0. Rules for Claude (always)
 
@@ -143,7 +143,7 @@ without a mount.
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
 | `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. |
-| `fs/` | `CryptoFs`, the path-based file system: `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids, name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
+| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids, name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
 | `rotate` | Offline, resumable master key rotation. |
@@ -179,6 +179,9 @@ fuser features: macOS `macos-no-mount` + `macfuse-4-compat`; Linux default
   (`--debug` or `RUST_LOG`; warns that debug logs show clear names).
 - `hardening.rs`: `RLIMIT_CORE = 0`, Linux `PR_SET_DUMPABLE 0`, macOS
   `PT_DENY_ATTACH`. Called first in `main`.
+- `limits.rs`: raises the soft `RLIMIT_NOFILE` to the hard limit (macOS: at
+  most `OPEN_MAX` 10240). Called in `main` after the logger; a failure is
+  only logged at debug level (the core adapts its cache).
 - `password.rs`: password / recovery key input from fd, env var (with
   warning) or TTY (`rpassword`).
 - `keypath.rs`: default key file path
@@ -287,7 +290,8 @@ Check: `scripts/check-license-headers.sh`.
 - Core test files: `golden.rs` (frozen vaults), `kat.rs` (known answers),
   `tamper.rs` (every change gives an error), `model.rs` (proptest against an
   in-memory model, also after reopen), `rotate.rs` (crash after every write
-  step). CLI: `crates/crypto-drive/tests/cli.rs`. Mount: 
+  step), `fd_limit.rs` (lowers the process open-file limit, so it must stay
+  the only test in its binary). CLI: `crates/crypto-drive/tests/cli.rs`. Mount: 
   `crates/crypto-drive-fuse/tests/mount.rs` (`#[ignore = "needs FUSE"]`).
 - A bug fix gets a test that fails without the fix (TDD is the usual way of
   work in this project).
@@ -361,7 +365,7 @@ owner to run the mount tests and the smoke test on the Mac (one command per
 block).
 
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
-clean, `cargo test --workspace`: 483 passed, 0 failed, 9 ignored (8 mount
+clean, `cargo test --workspace`: 489 passed, 0 failed, 9 ignored (8 mount
 tests + the golden generator).
 
 ## 8. Platform notes
@@ -453,16 +457,18 @@ does not repair. Details: README "Threat model" and "Limits".
 - Git: only `main` (history was squashed into a new start:
   `6c91912 chore: initial commit`). Remotes: `origin`
   (github.com/mkloubert/crypto-drive) and `gitea`. Tags `v0.1.0` (first run failed
-  on a CLI test race, fixed in the test helper) and `v0.1.1` (failed on the old
-  tag/version check, replaced by the tag-driven version). Repository version
-  placeholder: 0.0.0.
+  on a CLI test race, fixed in the test helper), `v0.1.1` (failed on the old
+  tag/version check, replaced by the tag-driven version) and `v0.1.2` (first
+  release with binaries for all six targets; README and the GitHub page
+  describe the download). Repository version placeholder: 0.0.0.
 - MVP done: all eight commands, format hardening (entry binding, key epochs,
   `rotate-key`, `recover` with two keys, `--pad-sizes`, name index), fuzzing,
   in-memory xattrs, LRU chunk cache, fsyncdir.
 - Verified by the owner on macOS 26.6.2 + macFUSE 5.5.0: all tests, real
   mount tests, smoke test, Finder copies.
-- Last commits (Linux container tested only): `18b13ca` rename lock in
-  open/setattr, `8932fc4` LRU chunk cache.
+- Review 2026-11-01: open-file limit fixed (CLI raises `RLIMIT_NOFILE`,
+  core sizes the directory cache from it), Linux container tested only, not
+  yet committed. Next: keep the mtime across the close flush (`cp -p`).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;

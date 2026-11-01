@@ -39,11 +39,35 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
-/// Number of directory states kept in the cache.
-const CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
-    Some(n) => n,
-    None => panic!("cache capacity must not be zero"),
-};
+/// Most directory states kept in the cache.
+const MAX_CACHE_CAPACITY: usize = 1024;
+
+/// Fewest directory states kept in the cache, also with a very low
+/// open-file limit.
+const MIN_CACHE_CAPACITY: usize = 16;
+
+/// The directory cache may use one part in `CACHE_FD_SHARE` of the
+/// open-file limit. Every cached directory state holds an open file
+/// descriptor; the rest of the limit stays for open files, the FUSE device
+/// and the libraries.
+const CACHE_FD_SHARE: u64 = 4;
+
+/// Size of the directory cache for the soft open-file limit
+/// `RLIMIT_NOFILE` (`None`: no limit). macOS terminals often start with a
+/// soft limit of 256, Linux with 1024; a cache of 1024 open directories
+/// then made every later open fail with EMFILE.
+fn dir_cache_capacity(soft_limit: Option<u64>) -> NonZeroUsize {
+    let share = soft_limit.map_or(u64::MAX, |l| l / CACHE_FD_SHARE);
+    let n = usize::try_from(share)
+        .unwrap_or(usize::MAX)
+        .clamp(MIN_CACHE_CAPACITY, MAX_CACHE_CAPACITY);
+    NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// The current soft open-file limit of the process (`None`: no limit).
+fn soft_open_file_limit() -> Option<u64> {
+    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileKind {
@@ -147,7 +171,7 @@ impl CryptoFs {
             padded: vault.marker.pad_sizes,
             max_name_length: vault.marker.max_name_length,
             root_id: vault.marker.vault_id,
-            cache: Mutex::new(LruCache::new(CACHE_CAPACITY)),
+            cache: Mutex::new(LruCache::new(dir_cache_capacity(soft_open_file_limit()))),
             shared_dirs: Mutex::new(HashMap::new()),
             next_generation: AtomicU64::new(0),
             open_files: Mutex::new(HashMap::new()),
@@ -166,6 +190,18 @@ mod tests {
     use crate::testutil::{real_name_of, test_vault, test_vault_with};
     use crate::vault::{CONTROL_PREFIX, DIR_FILE, NAME_FILE, open_with_master_key};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn dir_cache_capacity_follows_the_open_file_limit() {
+        let cap = |l| dir_cache_capacity(l).get();
+        assert_eq!(cap(Some(256)), 64);
+        assert_eq!(cap(Some(1024)), 256);
+        assert_eq!(cap(Some(10240)), MAX_CACHE_CAPACITY);
+        assert_eq!(cap(None), MAX_CACHE_CAPACITY);
+        assert_eq!(cap(Some(u64::MAX)), MAX_CACHE_CAPACITY);
+        assert_eq!(cap(Some(20)), MIN_CACHE_CAPACITY);
+        assert_eq!(cap(Some(0)), MIN_CACHE_CAPACITY);
+    }
 
     struct Fx {
         _tmp: tempfile::TempDir,

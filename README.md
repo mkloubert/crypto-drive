@@ -20,7 +20,30 @@ The exact format is in [docs/format.md](docs/format.md).
 
 ## Install
 
-You need Rust 1.99.1 (the repository pins it in `rust-toolchain.toml`).
+Prebuilt binaries are on the
+[releases page](https://github.com/mkloubert/crypto-drive/releases)
+(pre-releases). Each archive `crypto-drive-<tag>-<target>.tar.gz` holds the
+binary, `LICENSE`, `README.md` and `docs/format.md`, and has a `.sha256`
+file next to it. Targets:
+
+- macOS: `aarch64-apple-darwin` (Apple Silicon), `x86_64-apple-darwin` (Intel)
+- Linux: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and the
+  static `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`
+
+Check and unpack (example):
+
+```
+shasum -a 256 -c crypto-drive-<tag>-<target>.tar.gz.sha256
+tar -xzf crypto-drive-<tag>-<target>.tar.gz
+```
+
+Then put `crypto-drive` into your `PATH`. You still need macFUSE or FUSE 3
+(see below). The macOS binary is not signed; if you downloaded it with a
+browser, remove the quarantine flag once with
+`xattr -d com.apple.quarantine crypto-drive`.
+
+To build from source you need Rust 1.99.1 (the repository pins it in
+`rust-toolchain.toml`).
 
 macOS:
 

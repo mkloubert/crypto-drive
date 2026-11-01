@@ -330,7 +330,7 @@
         <div class="reveal max-w-2xl">
           <p class="label">03 — Install</p>
           <h2 class="mt-4 font-display text-5xl tracking-wide sm:text-6xl">Up and running in a minute</h2>
-          <p class="mt-4 text-ash">There are no prebuilt binaries yet. Build from source with Rust 1.99.1 (pinned in <code class="font-mono text-paper">rust-toolchain.toml</code>).</p>
+          <p class="mt-4 text-ash">Prebuilt binaries for macOS and Linux are on the <a href="https://github.com/mkloubert/crypto-drive/releases" class="text-ember-soft underline decoration-ember/40 underline-offset-4 hover:text-paper">releases page</a> (pre-releases, with SHA-256 checksums). Or build from source with Rust 1.99.1 (pinned in <code class="font-mono text-paper">rust-toolchain.toml</code>).</p>
         </div>
 
         <div class="reveal mt-12 grid gap-4 lg:grid-cols-[1fr_1.15fr]">
@@ -343,7 +343,9 @@
             <div data-os-panel="macos" class="mt-6 space-y-4">
               <p class="text-sm text-ash">1. Install macFUSE (needs its kernel extension; on Apple Silicon allow it in the Startup Security Utility and in System Settings).</p>
               <div class="code-block"><pre><code>brew install --cask macfuse</code></pre></div>
-              <p class="text-sm text-ash">2. Build:</p>
+              <p class="text-sm text-ash">2. Download <code class="font-mono text-paper">aarch64-apple-darwin</code> (Apple Silicon) or <code class="font-mono text-paper">x86_64-apple-darwin</code> (Intel) from the releases page, unpack it and put <code class="font-mono text-paper">crypto-drive</code> into your <code class="font-mono text-paper">PATH</code>. The binary is not signed: if you downloaded it with a browser, remove the quarantine flag once:</p>
+              <div class="code-block"><pre><code>xattr -d com.apple.quarantine crypto-drive</code></pre></div>
+              <p class="text-sm text-ash">Or build from source:</p>
               <div class="code-block"><pre><code>git clone https://github.com/mkloubert/crypto-drive.git</code></pre></div>
               <div class="code-block"><pre><code>cd crypto-drive && cargo build --release</code></pre></div>
               <p class="text-xs text-smoke">macFUSE libraries in another place? Build with <code class="font-mono">FUSE_LIB_DIR=&lt;dir&gt;</code>.</p>
@@ -351,7 +353,7 @@
             <div data-os-panel="linux" class="mt-6 hidden space-y-4">
               <p class="text-sm text-ash">1. Install FUSE 3 (gives <code class="font-mono text-paper">fusermount3</code>):</p>
               <div class="code-block"><pre><code>sudo apt install fuse3</code></pre></div>
-              <p class="text-sm text-ash">2. Build:</p>
+              <p class="text-sm text-ash">2. Download <code class="font-mono text-paper">x86_64</code> or <code class="font-mono text-paper">aarch64</code>, <code class="font-mono text-paper">-linux-gnu</code> or <code class="font-mono text-paper">-linux-musl</code> (static) from the releases page, unpack it and put <code class="font-mono text-paper">crypto-drive</code> into your <code class="font-mono text-paper">PATH</code>. Or build from source:</p>
               <div class="code-block"><pre><code>git clone https://github.com/mkloubert/crypto-drive.git</code></pre></div>
               <div class="code-block"><pre><code>cd crypto-drive && cargo build --release</code></pre></div>
               <p class="text-xs text-smoke">On Linux the drive talks to the kernel directly and needs no libfuse.</p>

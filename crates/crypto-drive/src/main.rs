@@ -19,6 +19,7 @@
 mod cmd;
 mod hardening;
 mod keypath;
+mod limits;
 mod password;
 
 use std::process::ExitCode;
@@ -99,6 +100,7 @@ fn main() -> ExitCode {
     hardening::deny_debugging();
     let cli = Cli::parse();
     init_logger(matches!(&cli.command, Command::Mount(a) if a.debug));
+    limits::raise_open_file_limit();
     let result = run(&cli.command);
     // `mount` warns once the drive is mounted (see cmd/mount.rs).
     if !matches!(cli.command, Command::Mount(_)) && crypto_drive_core::secret::mlock_failed() {
