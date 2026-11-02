@@ -26,6 +26,7 @@ use crate::content::{
 };
 use crate::error::{Error, Result};
 use crate::file::read_file_meta;
+use crate::fs::dirstate::MAX_DIR_IDS;
 use crate::keys::{DirId, EntryId};
 use crate::names::{MAX_ENCODED_NAME_LEN, NameKeys, long_entry_name, validate_name};
 use crate::vault::{
@@ -255,7 +256,10 @@ impl Checker<'_> {
             if matches!(role, DirRole::Dir { .. }) && is_dir_id_copy(&name) {
                 match read_dir_id(dir, &name) {
                     Ok(Some(id)) => {
-                        if !ids.contains(&id) {
+                        // The same cap as the drive (names are sorted, so
+                        // the same copies are used): names under the other
+                        // copies show up as undecryptable, as in the drive.
+                        if !ids.contains(&id) && ids.len() < MAX_DIR_IDS {
                             ids.push(id);
                         }
                         self.report(path, FindingKind::MultipleDirIds);
@@ -820,6 +824,37 @@ mod tests {
         let findings = f.check();
         assert_eq!(kinds(&findings), vec![FindingKind::ConflictCopy]);
         assert_eq!(findings[0].real_path, PathBuf::from(copy));
+    }
+
+    #[test]
+    fn dir_id_copies_over_the_cap_are_reported_and_not_used() {
+        use crate::fs::dirstate::MAX_DIR_IDS;
+        let f = fx(|fs| {
+            fs.mkdir(&p("dir"), 0o755).unwrap();
+        });
+        let dir = f.root.join(f.real("dir"));
+        let mut copies = Vec::new();
+        for i in 0..MAX_DIR_IDS + 4 {
+            let id: DirId = crate::secret::random_bytes::<16>().unwrap();
+            std::fs::write(dir.join(format!(".cd-dir (conflict {i:03})")), id).unwrap();
+            copies.push(id);
+        }
+        // A file named under the first copy that is not used.
+        let entry_id: DirId = crate::secret::random_bytes::<16>().unwrap();
+        let hidden = f
+            .names
+            .encrypt_write(&copies[MAX_DIR_IDS - 1], &entry_id, "hidden")
+            .unwrap();
+        std::fs::write(dir.join(&hidden), b"x").unwrap();
+        let findings = f.check();
+        let copies_found = findings
+            .iter()
+            .filter(|x| x.kind == FindingKind::MultipleDirIds)
+            .count();
+        assert_eq!(copies_found, MAX_DIR_IDS + 4);
+        assert!(findings.iter().any(|x| {
+            x.kind == FindingKind::UndecryptableName && x.real_path.ends_with(&hidden)
+        }));
     }
 
     #[test]

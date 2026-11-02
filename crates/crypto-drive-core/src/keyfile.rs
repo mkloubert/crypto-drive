@@ -38,6 +38,15 @@ const PAYLOAD_LEN_TWO: usize = 129;
 const PAYLOAD_AD_LEN: usize = 40;
 const WHAT: &str = ".cd-key";
 
+/// Most slots a reader accepts in one key file. A writer writes one (or a
+/// few); a crafted file with thousands of slots, each with the highest
+/// Argon2 values, would keep `unlock` busy for hours.
+pub const MAX_SLOTS: u16 = 16;
+
+/// Largest key file a reader reads (64 KiB). A real one is 108 or 144
+/// bytes; the limit keeps a huge file from filling the memory.
+pub const MAX_KEY_FILE_LEN: u64 = 64 * 1024;
+
 fn invalid() -> Error {
     Error::InvalidFormat { what: WHAT.into() }
 }
@@ -302,7 +311,7 @@ impl KeyFile {
             return Err(Error::UnsupportedVersion { found: version });
         }
         let count = u16::from_le_bytes([bytes[10], bytes[11]]);
-        if count == 0 {
+        if count == 0 || count > MAX_SLOTS {
             return Err(invalid());
         }
         let mut pos = HEADER_LEN;
@@ -329,8 +338,29 @@ impl KeyFile {
         Ok(Self { slots })
     }
 
+    /// Reads and parses a key file. Refuses anything but a regular file of
+    /// at most `MAX_KEY_FILE_LEN` bytes before it reads the content, so a
+    /// FIFO cannot block and a huge file cannot fill the memory (a key
+    /// file in the vault is under the control of the cloud).
     pub fn load(path: &Path) -> Result<Self> {
-        Self::from_bytes(&std::fs::read(path)?)
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK: opening a FIFO for reading would wait for a writer.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.len() > MAX_KEY_FILE_LEN {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::new();
+        // The file may grow after the check; never read more than allowed.
+        file.take(MAX_KEY_FILE_LEN + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_KEY_FILE_LEN {
+            return Err(invalid());
+        }
+        Self::from_bytes(&bytes)
     }
 
     /// Writes a new file. Never overwrites: `AlreadyExists` if `path` exists.
@@ -590,6 +620,65 @@ mod tests {
         b.extend_from_slice(&[9, 3, 0, b'x', b'y', b'z']);
         b[10] = 2;
         b
+    }
+
+    /// A key file with `extra` unknown slots after its password slot.
+    fn with_unknown_slots(kf: &KeyFile, extra: u16) -> Vec<u8> {
+        let mut b = kf.to_bytes();
+        for _ in 0..extra {
+            b.extend_from_slice(&[9, 1, 0, b'x']);
+        }
+        b[10..12].copy_from_slice(&(1 + extra).to_le_bytes());
+        b
+    }
+
+    /// A crafted key file with thousands of slots (each could ask for the
+    /// highest Argon2 values) must be refused before any slot is tried.
+    #[test]
+    fn more_than_max_slots_are_refused() {
+        let kf = KeyFile::new(&ks(), b"pw", p()).unwrap();
+        let at_max = with_unknown_slots(&kf, MAX_SLOTS - 1);
+        assert!(KeyFile::from_bytes(&at_max).unwrap().unlock(b"pw").is_ok());
+        assert!(matches!(
+            KeyFile::from_bytes(&with_unknown_slots(&kf, MAX_SLOTS)),
+            Err(Error::InvalidFormat { .. })
+        ));
+        assert!(matches!(
+            KeyFile::from_bytes(&with_unknown_slots(&kf, u16::MAX - 1)),
+            Err(Error::InvalidFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn load_refuses_a_file_over_the_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cd-key");
+        // Valid by format: a password slot and one unknown slot with the
+        // largest payload (65535 bytes), together over the limit.
+        let kf = KeyFile::new(&ks(), b"pw", p()).unwrap();
+        let mut big = kf.to_bytes();
+        big.extend_from_slice(&[9, 0xff, 0xff]);
+        big.resize(big.len() + 0xffff, b'x');
+        big[10] = 2;
+        assert!(big.len() as u64 > MAX_KEY_FILE_LEN);
+        assert!(KeyFile::from_bytes(&big).is_ok());
+        std::fs::write(&path, &big).unwrap();
+        assert!(matches!(
+            KeyFile::load(&path),
+            Err(Error::InvalidFormat { .. })
+        ));
+    }
+
+    /// A FIFO in place of the key file must not block the command.
+    #[test]
+    fn load_refuses_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cd-key");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        assert!(matches!(
+            KeyFile::load(&path),
+            Err(Error::InvalidFormat { .. })
+        ));
     }
 
     #[test]

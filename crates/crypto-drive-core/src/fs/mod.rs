@@ -201,6 +201,7 @@ mod tests {
     use crate::names::{LONG_PREFIX, NameKeys};
     use crate::testutil::{real_name_of, test_vault, test_vault_with};
     use crate::vault::{CONTROL_PREFIX, DIR_FILE, NAME_FILE, open_with_master_key};
+    use dirstate::MAX_DIR_IDS;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -579,6 +580,37 @@ mod tests {
             .try_into()
             .unwrap();
         real_name_of(&f.names, &canonical, &real_d, "g");
+    }
+
+    /// Thousands of planted `.cd-dir` copies must not make a listing try
+    /// every name with every id. Only the canonical id and the first
+    /// copies (by name) are used; names under the others stay hidden.
+    #[test]
+    fn dir_id_copies_are_capped() {
+        let f = fx();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        let real_d = f.real("d");
+        let mut copies = Vec::new();
+        for i in 0..MAX_DIR_IDS + 4 {
+            let id: DirId = crate::secret::random_bytes::<16>().unwrap();
+            // Zero padded, so the name order is the number order.
+            std::fs::write(real_d.join(format!(".cd-dir (conflict {i:03})")), id).unwrap();
+            copies.push(id);
+        }
+        let name_under = |id: &DirId, name: &str| {
+            let entry_id: DirId = crate::secret::random_bytes::<16>().unwrap();
+            let real = f.names.encrypt_write(id, &entry_id, name).unwrap();
+            std::fs::create_dir(real_d.join(&real)).unwrap();
+            std::fs::write(real_d.join(&real).join(DIR_FILE), entry_id).unwrap();
+        };
+        // The last copy that is used, and the first one that is not.
+        name_under(&copies[MAX_DIR_IDS - 2], "used");
+        name_under(&copies[MAX_DIR_IDS - 1], "ignored");
+        assert_eq!(listed(&f.fs, "d"), vec!["used"]);
+        let handle = DirHandle::open_root(&real_d).unwrap();
+        let ids = dirstate::read_dir_ids(&handle, "d", &handle.list().unwrap()).unwrap();
+        assert_eq!(ids.len(), MAX_DIR_IDS);
+        assert_eq!(&ids[1..], &copies[..MAX_DIR_IDS - 1]);
     }
 
     /// A known gap (README, threat model): a copy of the `.cd-dir` of `a`

@@ -134,6 +134,11 @@ Rules:
   without running Argon2. This protects against a
   memory or time attack with a crafted key file. If no usable slot is left, the
   unlock fails like a wrong password.
+- A reader MUST refuse a key file with more than 16 slots, a key file larger
+  than 65536 bytes, and anything that is not a regular file (for example a
+  FIFO), before it tries any slot. A real key file has one slot and 108 or
+  144 bytes; the limits protect against a crafted file that would fill the
+  memory, block, or need Argon2 for thousands of slots.
 
 ## 4. Vault marker `.cd-vault` (66 bytes)
 
@@ -338,8 +343,12 @@ A reader MUST handle this as follows:
    - Anything else is foreign and MUST be hidden.
 3. More than one `.cd-dir`: a control file whose name starts with `.cd-dir`
    and that is 16 bytes long (except `.cd-dir.tmp`) is a conflict copy of the
-   directory ID. A reader MUST try all found IDs when it decrypts names. A
-   writer MUST use the canonical `.cd-dir` for new entries.
+   directory ID. A reader MUST try the canonical ID and the IDs of the first
+   15 copies in byte order of their names (16 distinct IDs at most) when it
+   decrypts names. It MUST ignore further copies, so that planted copies
+   cannot make a listing try every name with thousands of IDs; names under
+   them are not shown. A check tool SHOULD report every copy. A writer MUST
+   use the canonical `.cd-dir` for new entries.
 
 Conflict copies are normal files. Renaming one encrypts its name again with a
 clean name and so resolves the conflict.

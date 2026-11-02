@@ -138,12 +138,12 @@ without a mount.
 |---|---|
 | `backing` | The only place with syscalls on the real (encrypted) directory. Directory handles (`openat`, `renameat`, `unlinkat`, `mkdirat`) via `rustix`, so `PATH_MAX` does not apply. The part to port for Windows. |
 | `vault` | `.cd-vault` marker, `init_vault`, `unlock_vault`, `open_with_master_key`, mount lock. |
-| `keyfile` | `.cd-key` format, password slots, Argon2 limits (`Argon2Params::MIN` for tests). |
+| `keyfile` | `.cd-key` format, password slots, Argon2 limits (`Argon2Params::MIN` for tests). Reader limits: `MAX_SLOTS` 16, `MAX_KEY_FILE_LEN` 64 KiB, regular file only (`load` opens with `O_NONBLOCK`, so a FIFO cannot block). |
 | `keys` | Key hierarchy: `MasterKey`, `KeySet` (1 or 2 epochs), HKDF sub keys, per-file keys, `DirId`. |
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
 | `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. |
-| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids, name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
+| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
 | `rotate` | Offline, resumable master key rotation. |
@@ -371,7 +371,7 @@ owner to run the mount tests and the smoke test on the Mac (one command per
 block).
 
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
-clean, `cargo test --workspace`: 506 passed, 0 failed, 10 ignored (9 mount
+clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator).
 
 ## 8. Platform notes
@@ -488,8 +488,9 @@ and "Limits", `docs/format.md` section 8 notes.
   step 11 "busy stop", to run on the Mac). `passwd` takes the vault lock (owner decision: race free beats `passwd`
   while mounted). Known gaps documented in README, `docs/format.md` section 8 and the
   GitHub page. Time-based flush of dirty chunks done (core + mount thread, container
-  only). Next: caps for hostile input (`.cd-dir` copies, key file slots and
-  size).
+  only). Caps for hostile input done (`MAX_DIR_IDS`, key file slots and size;
+  reader limits in `docs/format.md` 3.1 and 10). Next: the longer-term items
+  (need owner decisions).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;

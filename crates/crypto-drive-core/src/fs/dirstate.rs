@@ -502,6 +502,13 @@ impl CryptoFs {
     }
 }
 
+/// Most directory ids used for one real directory: the canonical one and
+/// the first copies by name. Copies are allowed for sync conflicts (a
+/// handful at most); each listing tries every name with every id, so
+/// thousands of planted copies would make a listing take minutes. Names
+/// under the other copies stay hidden; `check` reports every copy.
+pub const MAX_DIR_IDS: usize = 16;
+
 /// Reads the canonical `.cd-dir` and the ids of its sync conflict copies.
 pub(crate) fn read_dir_ids(handle: &DirHandle, real: &str, names: &[String]) -> Result<Vec<DirId>> {
     let bytes = handle.read_small(DIR_FILE, DIR_ID_LEN)?;
@@ -509,9 +516,15 @@ pub(crate) fn read_dir_ids(handle: &DirHandle, real: &str, names: &[String]) -> 
         .try_into()
         .map_err(|_| invalid(format!("{real}/{DIR_FILE}")))?;
     let mut ids = vec![canonical];
-    for n in names {
-        if n == DIR_FILE || n == DIR_TMP_FILE || !n.starts_with(DIR_FILE) {
-            continue;
+    // In name order, so the same copies are used on every listing.
+    let mut copies: Vec<&String> = names
+        .iter()
+        .filter(|n| *n != DIR_FILE && *n != DIR_TMP_FILE && n.starts_with(DIR_FILE))
+        .collect();
+    copies.sort();
+    for n in copies {
+        if ids.len() >= MAX_DIR_IDS {
+            break;
         }
         // Only regular files of exactly 16 bytes count; anything else is
         // ignored here and reported by `check`.

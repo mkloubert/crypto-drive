@@ -429,6 +429,12 @@ Not protected against:
   short entry blocks only its own name.
 - Entries left incomplete by an interrupted sync are hidden. `check` reports
   them.
+- A directory uses at most 16 directory ids: its own `.cd-dir` and the first
+  15 sync conflict copies of it (by name). Entries named under further
+  copies are hidden. Real sync conflicts make one or two copies; many more
+  point to a damaged or tampered vault. `check` reports every copy.
+- A key file with more than 16 slots, over 64 KiB, or that is not a regular
+  file is refused. A real key file has one slot and about 100 bytes.
 - A foreign file inside a real directory (for example `.DS_Store` after you
   browse the vault folder in Finder) makes the matching drive directory
   impossible to remove (`ENOTEMPTY`), although it looks empty in the drive.
