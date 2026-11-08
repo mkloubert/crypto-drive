@@ -53,6 +53,20 @@ pub struct MountArgs {
 
 const NESTED: &str = "the mount point must not be inside the vault, and the vault must not be inside the mount point";
 
+/// Shown when the drive is opened to other local users (threat model).
+pub(crate) const ALLOW_OTHER_WARNING: &str = "-o allow_other lets other local users use the drive; access is decided \
+     by mode bits from the vault, which are not authenticated (anyone who \
+     can change the synced folder can open files to all users)";
+
+/// True if the `-o` options contain `allow_other`. One `-o` value may hold
+/// a comma list (`-o ro,allow_other`), as with mount(8).
+fn opens_to_other_users(options: &[String]) -> bool {
+    options
+        .iter()
+        .flat_map(|o| o.split(','))
+        .any(|o| o.trim() == "allow_other")
+}
+
 /// Checks the paths before anything else happens (no password is asked).
 pub fn validate_mount_paths(vault_dir: &Path, mountpoint: &Path) -> Result<(), CliError> {
     let vault = vault_dir.canonicalize().map_err(|e| {
@@ -181,6 +195,10 @@ fn mount_error_message(e: &std::io::Error, mountpoint: &Path) -> String {
 pub fn run(args: &MountArgs) -> Result<i32, CliError> {
     super::require_vault_and_key_file(&args.vault_dir, args.key_file.as_deref())?;
     validate_mount_paths(&args.vault_dir, &args.mountpoint)?;
+    // Before the fork, so the daemon mode shows it too.
+    if opens_to_other_users(&args.options) {
+        eprintln!("warning: {ALLOW_OTHER_WARNING}");
+    }
     if args.daemon {
         return daemon(args);
     }
@@ -323,6 +341,32 @@ mod tests {
     use std::path::Path;
 
     const NESTED: &str = "the mount point must not be inside the vault, and the vault must not be inside the mount point";
+
+    fn opts(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn allow_other_is_found_also_in_a_list() {
+        assert!(opens_to_other_users(&opts(&["allow_other"])));
+        assert!(opens_to_other_users(&opts(&["ro", "x=1,allow_other"])));
+        assert!(opens_to_other_users(&opts(&[" allow_other "])));
+        assert!(!opens_to_other_users(&opts(&[])));
+        assert!(!opens_to_other_users(&opts(&[
+            "allow_root",
+            "volname=allow_other"
+        ])));
+    }
+
+    #[test]
+    fn allow_other_warning_text() {
+        assert_eq!(
+            ALLOW_OTHER_WARNING,
+            "-o allow_other lets other local users use the drive; access is decided \
+             by mode bits from the vault, which are not authenticated (anyone who \
+             can change the synced folder can open files to all users)"
+        );
+    }
 
     fn usage(r: Result<(), CliError>) -> String {
         match r {

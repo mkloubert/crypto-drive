@@ -312,6 +312,11 @@ Non-normative notes on what format version 1 does not hide or detect:
   give the same real name, so renaming an entry back gives its old real name.
 - A chunk is rewritten in place with a new nonce; which chunk indexes
   changed between two copies of a file is visible.
+- File system metadata of the real entries (mode bits, owner, times) is not
+  part of the format and is not authenticated. An implementation that shows
+  mode bits in the drive SHOULD drop setuid, setgid and sticky bits and
+  SHOULD NOT treat the `rwx` bits as a security boundary between local
+  users.
 
 ## 9. Directory rules
 

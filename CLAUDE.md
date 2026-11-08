@@ -2,7 +2,8 @@
 
 Guide for Claude Code sessions in this repository. Read it fully at the start
 of every session. Last full project scan: 2026-11-01 (branch `main`,
-commit `34a0dee`, plus the open-file limit work).
+commit `34a0dee`, plus the open-file limit work). Last change: 2026-11-08
+(review finding S1, mode bits).
 
 ## 0. Rules for Claude (always)
 
@@ -160,7 +161,7 @@ shared `Arc<Mutex<OpenFile>>` per real file for all handles, handle table.
 
 | Module | Role |
 |---|---|
-| `adapter` | `FuseFs`: `fuser::Filesystem` on top of `CryptoFs`. `do_*` methods hold the logic. A `rename_lock: RwLock<()>`: rename takes the write side; open and setattr take the read side from lookup to the end. Open flags: Linux `FOPEN_KEEP_CACHE` for unchanged files, macOS `FOPEN_PURGE_UBC | FOPEN_PURGE_ATTR`. TTL 1 s. |
+| `adapter` | `FuseFs`: `fuser::Filesystem` on top of `CryptoFs`. `do_*` methods hold the logic. A `rename_lock: RwLock<()>`: rename takes the write side; open and setattr take the read side from lookup to the end. `PERM_MASK` 0o777: mode bits are reported and set without setuid / setgid / sticky (they come from unauthenticated vault data, review S1). Open flags: Linux `FOPEN_KEEP_CACHE` for unchanged files, macOS `FOPEN_PURGE_UBC | FOPEN_PURGE_ATTR`. TTL 1 s. |
 | `inodes` | `InodeTable`: inode ↔ clear path, lookup counts, `forget`, rename of subtrees by range (sorted map). |
 | `xattrs` | In-memory xattrs per clear path (never on disk). 1 MiB per entry, 64 MiB total; values over the limit are accepted but dropped. Linux keeps only `user.*`. |
 | `errno` | `to_errno`: core error → errno (spec section 8 table). |
@@ -169,7 +170,8 @@ shared `Arc<Mutex<OpenFile>>` per real file for all handles, handle table.
 
 fuser features: macOS `macos-no-mount` + `macfuse-4-compat`; Linux default
 (talks to the kernel directly, `fusermount3` mounts). Mount options: always
-`default_permissions`, `fsname=crypto-drive`; macOS `volname=<vault name>`.
+`default_permissions`, `fsname=crypto-drive`, `nosuid`, `nodev` (also for root;
+`fusermount3` adds the last two only for normal users); macOS `volname=<vault name>`.
 **Never add `noappledouble`** (Finder copies fail with -8062).
 
 ### 3.3 `crypto-drive` (CLI)
@@ -189,7 +191,8 @@ fuser features: macOS `macos-no-mount` + `macfuse-4-compat`; Linux default
 - `cmd/*.rs`: one file per subcommand: `init`, `mount` (incl. `--daemon`:
   fork before any thread, status pipe, `setsid`, stdio to `/dev/null`;
   SIGINT/SIGTERM/SIGHUP unmount cleanly, a busy drive stays mounted; a dead
-  mount point (ENOTCONN / ENXIO) gets an `unmount --force` hint), `unmount`, `passwd`, `rotate-key`,
+  mount point (ENOTCONN / ENXIO) gets an `unmount --force` hint; `-o allow_other`,
+  also inside a comma list, gives `ALLOW_OTHER_WARNING` before the fork), `unmount`, `passwd`, `rotate-key`,
   `recovery-key`, `recover`, `check`. `passwd` and `recover` take the vault
   lock through `cmd::lock_vault_for_key_change` (message `VAULT_IN_USE`), like
   `rotate-key` and `mount`, so key file writers never run side by side.
@@ -372,7 +375,8 @@ block).
 
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
-tests + the golden generator).
+tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
+10 ignored.
 
 ## 8. Platform notes
 
@@ -489,7 +493,13 @@ and "Limits", `docs/format.md` section 8 notes.
   while mounted). Known gaps documented in README, `docs/format.md` section 8 and the
   GitHub page. Time-based flush of dirty chunks done (core + mount thread, container
   only). Caps for hostile input done (`MAX_DIR_IDS`, key file slots and size;
-  reader limits in `docs/format.md` 3.1 and 10). Next: the longer-term items
+  reader limits in `docs/format.md` 3.1 and 10).
+- Review 2026-11-02 in untracked `REPORT.md` (S*, R*, P* findings, next steps
+  in its section 5). S1 done 2026-11-08, not yet committed, Linux container
+  only: mode bits clamped to 0o777, `nosuid,nodev` always, warning on
+  `-o allow_other` (owner may still choose to refuse it instead), README
+  threat model, `docs/format.md` 8 note, GitHub page. Next: S2 (`set_mode`
+  follows links), S3 + S4 + S5 (key hygiene). Then: the longer-term items
   (need owner decisions).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode

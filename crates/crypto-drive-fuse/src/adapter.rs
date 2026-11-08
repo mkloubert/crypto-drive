@@ -43,7 +43,11 @@ const TTL: Duration = Duration::from_secs(1);
 const GENERATION: Generation = Generation(0);
 const BLOCK_SIZE: u32 = 4096;
 const NAME_MAX: u32 = 255;
-const PERM_MASK: u32 = 0o7777;
+/// Only the `rwx` bits. Mode bits come from the real files in the vault and
+/// are not authenticated (anyone who controls the synced folder can change
+/// them), and the kernel decides access from them (`default_permissions`).
+/// So setuid, setgid and sticky are never reported and never set.
+const PERM_MASK: u32 = 0o777;
 /// Snapshot lines prepared per step while filling a readdir reply.
 const READDIR_CHUNK: usize = 128;
 /// Set in every synthetic readdir inode, so it never collides with a table
@@ -1129,6 +1133,41 @@ mod tests {
         assert_eq!(d.perm, 0o755);
         assert_eq!(to_file_attr(1, &attr(FileKind::File, 512, 0)).blocks, 1);
         assert_eq!(to_file_attr(1, &attr(FileKind::File, 513, 0)).blocks, 2);
+    }
+
+    #[test]
+    fn to_file_attr_drops_setuid_setgid_and_sticky() {
+        // Mode bits come from the real file and are not authenticated.
+        let a = to_file_attr(7, &attr(FileKind::File, 0, 0o107777));
+        assert_eq!(a.perm, 0o777);
+        let d = to_file_attr(1, &attr(FileKind::Directory, 0, 0o41755));
+        assert_eq!(d.perm, 0o755);
+    }
+
+    #[test]
+    fn chmod_create_and_mkdir_never_set_special_bits() {
+        let f = fx();
+        let root = INodeNo(ROOT_INO);
+        let (a, fh) = f
+            .fuse
+            .do_create(root, os("a"), 0o4755, 0, libc::O_WRONLY)
+            .unwrap();
+        f.fuse.fs.release(fh).unwrap();
+        assert_eq!(a.perm, 0o755);
+        let real = |p: &str| f.fuse.fs.getattr(&VPath::parse(p).unwrap()).unwrap().mode & 0o7777;
+        assert_eq!(real("a"), 0o755);
+
+        let changes = SetAttr {
+            mode: Some(0o106750),
+            ..SetAttr::default()
+        };
+        let got = f.fuse.do_setattr(a.ino, None, &changes).unwrap();
+        assert_eq!(got.perm, 0o750);
+        assert_eq!(real("a"), 0o750);
+
+        let d = f.fuse.do_mkdir(root, os("d"), 0o3777, 0o022).unwrap();
+        assert_eq!(d.perm, 0o755);
+        assert_eq!(real("d"), 0o755);
     }
 
     #[test]

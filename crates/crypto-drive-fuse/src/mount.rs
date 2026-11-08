@@ -59,6 +59,11 @@ pub fn mount_options(req: &MountRequest) -> Vec<MountOption> {
     let mut options = vec![
         MountOption::FSName("crypto-drive".to_string()),
         MountOption::DefaultPermissions,
+        // Always, also for root: mode bits are not authenticated (see
+        // `PERM_MASK` in the adapter), and Linux `fusermount3` adds these
+        // two only for normal users.
+        MountOption::NoSuid,
+        MountOption::NoDev,
     ];
     // No `noappledouble` on macOS: it makes the kernel refuse `.DS_Store`
     // (and `._*`) files, and Finder aborts a whole folder copy when it
@@ -77,6 +82,8 @@ fn option_text(option: &MountOption) -> io::Result<String> {
     match option {
         MountOption::FSName(name) => Ok(format!("fsname={name}")),
         MountOption::DefaultPermissions => Ok("default_permissions".to_string()),
+        MountOption::NoSuid => Ok("nosuid".to_string()),
+        MountOption::NoDev => Ok("nodev".to_string()),
         MountOption::CUSTOM(text) => Ok(text.clone()),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -345,6 +352,8 @@ mod tests {
             .collect();
         assert_eq!(texts[0], "fsname=crypto-drive");
         assert_eq!(texts[1], "default_permissions");
+        assert_eq!(texts[2], "nosuid");
+        assert_eq!(texts[3], "nodev");
         assert_eq!(texts.last().unwrap(), "backend=x");
         assert!(option_text(&MountOption::RO).is_err());
     }
@@ -498,6 +507,8 @@ mod tests {
             vec![
                 fuser::MountOption::FSName("crypto-drive".into()),
                 fuser::MountOption::DefaultPermissions,
+                fuser::MountOption::NoSuid,
+                fuser::MountOption::NoDev,
                 fuser::MountOption::CUSTOM("allow_other".into()),
             ]
         );
@@ -512,6 +523,8 @@ mod tests {
             vec![
                 fuser::MountOption::FSName("crypto-drive".into()),
                 fuser::MountOption::DefaultPermissions,
+                fuser::MountOption::NoSuid,
+                fuser::MountOption::NoDev,
                 fuser::MountOption::CUSTOM("volname=My Vault".into()),
                 fuser::MountOption::CUSTOM("x".into()),
             ]

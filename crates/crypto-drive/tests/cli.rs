@@ -603,6 +603,27 @@ fn mount_with_debug_warns_about_clear_names() {
 }
 
 #[test]
+fn mount_with_allow_other_warns_once_also_as_daemon() {
+    let (_dir, vault, mnt) = vault_and_mountpoint();
+    for daemon in [false, true] {
+        let mut args = vec!["mount", "-o", "ro,allow_other"];
+        if daemon {
+            args.push("--daemon");
+        }
+        args.extend([vault.to_str().unwrap(), mnt.to_str().unwrap()]);
+        let out = run_without_stdin(&args, &[("CRYPTO_DRIVE_PASSWORD", "wrong")]);
+        assert_eq!(out.status.code(), Some(2));
+        let err = stderr(&out);
+        assert_eq!(
+            err.matches("warning: -o allow_other lets other local users use the drive")
+                .count(),
+            1,
+            "daemon {daemon}: {err}"
+        );
+    }
+}
+
+#[test]
 fn unmount_of_a_plain_directory_fails() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_without_stdin(&["unmount", dir.path().to_str().unwrap()], &[]);

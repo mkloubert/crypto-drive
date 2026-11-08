@@ -109,7 +109,10 @@ crypto-drive unmount ~/drive
   dead ("Transport endpoint is not connected" on Linux, "Device not
   configured" on macOS). `mount` then points to
   `crypto-drive unmount --force <mountpoint>`.
-- `-o OPT` passes a FUSE option to macFUSE or Linux FUSE.
+- `-o OPT` passes a FUSE option to macFUSE or Linux FUSE. The drive is
+  always mounted with `nosuid,nodev`. `-o allow_other` lets other local
+  users into the drive and gives a warning (see "Threat model": mode bits
+  are not authenticated).
 - `unmount` uses `umount` on macOS and `fusermount3 -u` on Linux. Use
   `--force` for a busy drive.
 - Use `--debug` to get detailed logs. They contain clear file names.
@@ -348,6 +351,15 @@ Not protected against:
   of old ciphertext plus an old key that someone already has. Until you run
   `rotate-key`, `passwd` does not change the master key: someone with an old
   copy of `.cd-key` and the old password can still open the vault.
+- Changed mode bits. The permissions (`rwx`) shown in the drive are the
+  mode bits of the real files in the vault. They are not authenticated:
+  someone who can change the vault (or a sync client that syncs
+  permissions, like Syncthing) can set a file to `0777`. The drive never
+  shows or sets setuid, setgid or sticky bits and is always mounted with
+  `nosuid,nodev`. Without `-o allow_other` only you can use the drive, so
+  the bits do not matter for other users. With `-o allow_other` they decide
+  which other local users can read and write clear files; `mount` warns
+  about this.
 
 ## Limits
 
