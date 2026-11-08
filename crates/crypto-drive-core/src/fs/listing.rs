@@ -18,7 +18,7 @@
 
 use super::CryptoFs;
 use super::FileKind;
-use super::dirstate::{DirState, EntryRef};
+use super::dirstate::{DirState, EntryRef, KeptName};
 use crate::backing::{DirHandle, Kind};
 use crate::conflict::{conflict_display_name, long_candidate, short_candidates};
 use crate::error::{Error, Result};
@@ -195,6 +195,16 @@ impl Found {
             layout: self.layout,
             entry_id: self.entry_id,
             epoch: self.epoch,
+            conflict_of: None,
+        }
+    }
+
+    /// The entry for a conflict display name.
+    fn into_conflict_entry(self) -> EntryRef {
+        let clear = self.clear.clone();
+        EntryRef {
+            conflict_of: Some(clear),
+            ..self.into_entry()
         }
     }
 }
@@ -211,7 +221,7 @@ impl CryptoFs {
             return Ok(f(l));
         }
         let now = self.now();
-        let listing = self.build_listing(state)?;
+        let listing = self.build_listing(state, index.previous.as_ref())?;
         // A listing that skipped unreadable entries is not kept, so they show
         // up as soon as they can be read (a chmod does not change the mtime).
         // An outdated state does not set the index of the newer one.
@@ -221,6 +231,9 @@ impl CryptoFs {
         // Read after the stored mtime became safe, the listing holds every
         // change of its tick (spec 2026-11-08 coarse mtime, 3.2).
         index.listing_built_at(now);
+        // The new listing holds every kept name; until it is stored the old
+        // names stay for the next try.
+        index.previous = None;
         Ok(f(index.listing.insert(listing)))
     }
 
@@ -283,8 +296,16 @@ impl CryptoFs {
         Ok(Some(Found::new(real, d, layout, conflict)))
     }
 
-    /// Lists the real directory and assigns display names (spec 5.3).
-    fn build_listing(&self, state: &DirState) -> Result<Listing> {
+    /// Lists the real directory and assigns display names (spec 5.3). An
+    /// entry keeps its name from `previous` (real name to display name of
+    /// the last listing), so names do not move while the drive is mounted;
+    /// only new entries are named by sort order (spec 2026-11-08 stable
+    /// display names, 3.2).
+    fn build_listing(
+        &self,
+        state: &DirState,
+        previous: Option<&HashMap<String, KeptName>>,
+    ) -> Result<Listing> {
         #[cfg(test)]
         LISTINGS_BUILT.with(|c| c.set(c.get() + 1));
         let mut names = state.handle.list()?;
@@ -322,10 +343,23 @@ impl CryptoFs {
         }
         warn_extra_ids(state, &normal, &conflicts);
         let mut entries = BTreeMap::new();
-        // The same clear name under two directory ids: the one `find` would
-        // pick first keeps the name, the others become conflict entries.
-        normal.sort_by(|a, b| (a.id_index, &a.real).cmp(&(b.id_index, &b.real)));
-        for f in normal {
+        let previous_of = |f: &Found| previous.and_then(|p| p.get(&f.real)).map(|k| &k.display);
+        // 1. An entry that had the plain name keeps it.
+        let (kept, rest): (Vec<Found>, Vec<Found>) = normal
+            .into_iter()
+            .partition(|f| previous_of(f) == Some(&f.clear));
+        for f in kept {
+            entries.insert(f.clear.clone(), f.into_entry());
+        }
+        // 2. An entry that had a conflict name keeps that one (step 3), also
+        // when the plain name is free now. The same clear name under two
+        // directory ids: the one `find` would pick first gets the name, the
+        // others become conflict entries.
+        let (had_conflict_name, mut new): (Vec<Found>, Vec<Found>) =
+            rest.into_iter().partition(|f| previous_of(f).is_some());
+        conflicts.extend(had_conflict_name);
+        new.sort_by(|a, b| (a.id_index, &a.real).cmp(&(b.id_index, &b.real)));
+        for f in new {
             match entries.entry(f.clear.clone()) {
                 btree_map::Entry::Vacant(slot) => {
                     slot.insert(f.into_entry());
@@ -333,11 +367,21 @@ impl CryptoFs {
                 btree_map::Entry::Occupied(_) => conflicts.push(f),
             }
         }
-        // N counts per clear name in the order of the real names. A display
-        // name that is already used takes the next N.
-        conflicts.sort_by(|a, b| a.real.cmp(&b.real));
-        let mut next_n: HashMap<String, u32> = HashMap::new();
+        // 3. A conflict entry keeps its conflict name while it is free.
+        let mut unnamed = Vec::new();
         for f in conflicts {
+            match previous_of(&f) {
+                Some(name) if *name != f.clear && !entries.contains_key(name) => {
+                    entries.insert(name.clone(), f.into_conflict_entry());
+                }
+                _ => unnamed.push(f),
+            }
+        }
+        // 4. N counts per clear name in the order of the real names. A
+        // display name that is already used takes the next N.
+        unnamed.sort_by(|a, b| a.real.cmp(&b.real));
+        let mut next_n: HashMap<String, u32> = HashMap::new();
+        for f in unnamed {
             let n = next_n.entry(f.clear.clone()).or_insert(1);
             let display = loop {
                 let candidate = conflict_display_name(&f.clear, *n);
@@ -346,7 +390,7 @@ impl CryptoFs {
                     break candidate;
                 }
             };
-            entries.insert(display, f.into_entry());
+            entries.insert(display, f.into_conflict_entry());
         }
         Ok(Listing { entries, skipped })
     }

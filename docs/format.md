@@ -358,7 +358,8 @@ A reader MUST handle this as follows:
      longest to the shortest until one authenticates (some suffixes use only
      B64 characters). If it finds one, it MUST show the entry as
      `<stem> (conflict N)<.ext>`. `N` starts at 1 and follows the sort order
-     of the real names. No pattern per sync client is used.
+     of the real names. A running reader MAY keep the display names it
+     already gave while those entries exist. No pattern per sync client is used.
    - Anything else is foreign and MUST be hidden.
 3. More than one `.cd-dir`: a control file whose name starts with `.cd-dir`
    and that is 16 bytes long (except `.cd-dir.tmp`) is a conflict copy of the

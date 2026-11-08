@@ -17,7 +17,7 @@
 //! Rename and move for all name layouts (spec 5.5).
 
 use super::dirs::{CONTROL_FILE_MODE, ok_if_missing, remove_empty_dir, remove_file_entry};
-use super::dirstate::{EntryRef, display_key};
+use super::dirstate::{DirState, EntryRef, display_key};
 use super::files::LONG_ENTRY_MODE;
 use super::listing::Layout;
 use super::{CryptoFs, VPath};
@@ -25,6 +25,19 @@ use crate::backing::DirHandle;
 use crate::error::{Error, Result};
 use crate::names::BackingName;
 use crate::vault::{CONTENT_FILE, NAME_FILE};
+
+#[cfg(test)]
+thread_local! {
+    /// Warnings about a replaced entry with conflict copies in this thread.
+    static REPLACE_WARNINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many warnings about a replaced entry with conflict copies this
+/// thread has logged.
+#[cfg(test)]
+pub(crate) fn replace_warnings() -> usize {
+    REPLACE_WARNINGS.with(|c| c.get())
+}
 
 /// True if both handles are the same real directory.
 fn same_dir(a: &DirHandle, b: &DirHandle) -> Result<bool> {
@@ -196,7 +209,39 @@ pub(crate) fn move_entry(
     }
 }
 
+/// Logs that a rename replaced the entry `real`, which has sync conflict
+/// copies with the same name (spec 2026-11-08 stable display names, 3.4).
+/// Only the real name is logged, never a clear name.
+fn warn_replaced_copy(real: &str) {
+    #[cfg(test)]
+    REPLACE_WARNINGS.with(|c| c.set(c.get() + 1));
+    log::warn!(
+        "a rename replaced the entry {real}, which has sync conflict copies with the same name; check them"
+    );
+}
+
 impl CryptoFs {
+    /// True if the target `target` of the name `to_name` in `dir` is a
+    /// conflict entry or has conflict entries with the same clear name,
+    /// not counting the entry `moving` (the source of the rename).
+    fn has_conflict_copies(
+        &self,
+        dir: &DirState,
+        target: &EntryRef,
+        to_name: &str,
+        moving: Option<&str>,
+    ) -> Result<bool> {
+        if target.conflict_of.is_some() {
+            return Ok(true);
+        }
+        let clear = display_key(to_name);
+        self.with_listing(dir, |l| {
+            l.entries.values().any(|e| {
+                e.conflict_of.as_deref() == Some(clear.as_str()) && Some(e.real.as_str()) != moving
+            })
+        })
+    }
+
     /// Renames or moves a file or directory (spec 5.5). An existing target
     /// file or empty target directory is replaced. The new name is encrypted
     /// with the same entry id under the canonical id of the target parent
@@ -235,11 +280,27 @@ impl CryptoFs {
                 return Ok(());
             }
             moves_dir = src.layout.is_dir() || target.as_ref().is_some_and(|t| t.layout.is_dir());
+            let replaces_copy = match &target {
+                Some(t) if !t.layout.is_dir() => {
+                    // The source leaves the group: renaming a copy over the
+                    // plain name resolves the conflict.
+                    let moving =
+                        same_dir(&src_dir.handle, &dst_dir.handle)?.then_some(src.real.as_str());
+                    self.has_conflict_copies(dst_dir, t, to_name, moving)?
+                }
+                _ => false,
+            };
             let backing = self.new_entry_name(dst_dir, &src.entry_id, to_name)?;
             let result = match &target {
                 Some(t) => replace_entry(&src_dir.handle, &src, &dst_dir.handle, t, &backing),
                 None => move_entry(&src_dir.handle, &src, &dst_dir.handle, &backing).map(|()| true),
             };
+            if replaces_copy
+                && result.is_ok()
+                && let Some(t) = &target
+            {
+                warn_replaced_copy(&t.real);
+            }
             // After a failure partway the indexes are built again.
             let index_ok = matches!(result, Ok(true));
             if index_ok {
@@ -944,5 +1005,161 @@ mod tests {
         let v = open_with_master_key(&f.root, &f.mk).unwrap();
         let findings = crate::check::check_vault(&v).unwrap();
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// Plants an entry "from another device" with the clear name `name` and
+    /// the content `data` in the root: a file made through the drive (so
+    /// content and entry id match) whose real file is renamed from outside
+    /// to the encrypted `name` under its own entry id. Tries new files until
+    /// that real name sorts before `before`. Returns the planted real name.
+    fn plant_same_name(f: &Fx, name: &str, data: &[u8], before: &str) -> String {
+        for _ in 0..64 {
+            write_file(&f.fs, "plant.tmp", data);
+            let tmp = f.real("plant.tmp");
+            let (_, entry_id, _) = f.names.decrypt_any(&f.vault_id, &tmp).unwrap();
+            let new = f.names.encrypt_write(&f.vault_id, &entry_id, name).unwrap();
+            if new.as_str() < before {
+                std::fs::rename(f.root.join(&tmp), f.root.join(&new)).unwrap();
+                f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
+                return new;
+            }
+            f.fs.unlink(&p("plant.tmp")).unwrap();
+        }
+        panic!("no planted name sorts before {before}");
+    }
+
+    /// `notes.txt` with "A", then a planted `notes.txt` with "B" that sorts
+    /// first. Returns the real names of A and B.
+    fn notes_with_arrived_copy(f: &Fx) -> (String, String) {
+        write_file(&f.fs, "notes.txt", b"A");
+        let a = f.real("notes.txt");
+        // The drive has shown the directory before the copy arrives.
+        assert!(listed(&f.fs, "/").contains(&"notes.txt".to_owned()));
+        let b = plant_same_name(f, "notes.txt", b"B", &a);
+        (a, b)
+    }
+
+    #[test]
+    fn plain_name_stays_when_copy_arrives() {
+        let f = fx();
+        notes_with_arrived_copy(&f);
+        assert_eq!(
+            listed(&f.fs, "/"),
+            vec!["notes (conflict 1).txt", "notes.txt"]
+        );
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        assert_eq!(read_file(&f.fs, "notes (conflict 1).txt"), b"B");
+    }
+
+    #[test]
+    fn own_save_replaces_own_entry_not_the_arrived_one() {
+        let f = fx();
+        let (_, b) = notes_with_arrived_copy(&f);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        // An editor saves through a temporary file and a rename.
+        write_file(&f.fs, "tmp", b"A2");
+        f.fs.rename(&p("tmp"), &p("notes.txt")).unwrap();
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A2");
+        assert_eq!(read_file(&f.fs, "notes (conflict 1).txt"), b"B");
+        assert!(f.root.join(&b).exists(), "the other device's entry is gone");
+    }
+
+    #[test]
+    fn plain_name_stays_after_racy_rebuild() {
+        let f = fx();
+        notes_with_arrived_copy(&f);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        // An own change, then the listing is built again after the window.
+        write_file(&f.fs, "other", b"x");
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        assert_eq!(read_file(&f.fs, "notes (conflict 1).txt"), b"B");
+    }
+
+    #[test]
+    fn conflict_numbers_stay_after_one_is_removed() {
+        let f = fx();
+        let (a, b) = notes_with_arrived_copy(&f);
+        let c = plant_same_name(&f, "notes.txt", b"C", &a);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        let one = read_file(&f.fs, "notes (conflict 1).txt");
+        let two = read_file(&f.fs, "notes (conflict 2).txt");
+        let real_one = if one == b"B" { &b } else { &c };
+        std::fs::remove_file(f.root.join(real_one)).unwrap();
+        f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
+        assert_eq!(
+            listed(&f.fs, "/"),
+            vec!["notes (conflict 2).txt", "notes.txt"]
+        );
+        assert_eq!(read_file(&f.fs, "notes (conflict 2).txt"), two);
+    }
+
+    #[test]
+    fn freed_plain_name_is_not_taken_by_copy() {
+        let f = fx();
+        notes_with_arrived_copy(&f);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        f.fs.unlink(&p("notes.txt")).unwrap();
+        f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
+        assert_eq!(listed(&f.fs, "/"), vec!["notes (conflict 1).txt"]);
+        assert_eq!(read_file(&f.fs, "notes (conflict 1).txt"), b"B");
+    }
+
+    #[test]
+    fn names_follow_sort_order_after_remount() {
+        let f = fx();
+        notes_with_arrived_copy(&f);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        let fs = CryptoFs::new(open_with_master_key(&f.root, &f.mk).unwrap()).unwrap();
+        assert_eq!(read_file(&fs, "notes.txt"), b"B");
+        assert_eq!(read_file(&fs, "notes (conflict 1).txt"), b"A");
+    }
+
+    #[test]
+    fn previous_survives_unkept_listing() {
+        let f = fx();
+        write_file(&f.fs, "other", b"x");
+        let other = f.real("other");
+        notes_with_arrived_copy(&f);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        // One unreadable entry: the next listing is used but not kept.
+        crate::fs::listing::fail_stat_of(Some(other));
+        f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
+        std::fs::write(f.root.join(".touch"), b"").unwrap();
+        f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        crate::fs::listing::fail_stat_of(None);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+    }
+
+    #[test]
+    fn rename_over_entry_with_conflict_copy_warns() {
+        let f = fx();
+        notes_with_arrived_copy(&f);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        let before = super::replace_warnings();
+        write_file(&f.fs, "tmp", b"A2");
+        f.fs.rename(&p("tmp"), &p("notes.txt")).unwrap();
+        assert_eq!(super::replace_warnings(), before + 1);
+        // A name without conflict copies: no warning.
+        write_file(&f.fs, "other.txt", b"o");
+        write_file(&f.fs, "tmp2", b"o2");
+        f.fs.rename(&p("tmp2"), &p("other.txt")).unwrap();
+        assert_eq!(super::replace_warnings(), before + 1);
+    }
+
+    #[test]
+    fn renaming_the_copy_over_the_plain_name_does_not_warn() {
+        let f = fx();
+        notes_with_arrived_copy(&f);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"A");
+        let before = super::replace_warnings();
+        // The user keeps the copy: the documented way to resolve a conflict.
+        f.fs.rename(&p("notes (conflict 1).txt"), &p("notes.txt"))
+            .unwrap();
+        assert_eq!(listed(&f.fs, "/"), vec!["notes.txt"]);
+        assert_eq!(read_file(&f.fs, "notes.txt"), b"B");
+        assert_eq!(super::replace_warnings(), before);
     }
 }

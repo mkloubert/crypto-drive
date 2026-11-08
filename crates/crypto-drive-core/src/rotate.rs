@@ -240,6 +240,7 @@ impl Found {
             layout,
             entry_id: self.entry_id,
             epoch: self.epoch,
+            conflict_of: None,
         }
     }
 }
@@ -259,6 +260,7 @@ fn tmp_ref(entry_id: EntryId, epoch: Epoch) -> EntryRef {
         layout: Layout::ShortFile,
         entry_id,
         epoch,
+        conflict_of: None,
     }
 }
 

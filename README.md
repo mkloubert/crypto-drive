@@ -466,8 +466,20 @@ Not protected against:
   files and expect older synced data to survive a crash; their own recovery
   cannot repair such a chunk. Keep backups, and prefer to keep such files
   outside the drive.
-- If two entries in a directory have the same clear name, it is not defined
-  which one gets the plain name. The other shows as `(conflict N)`.
+- If two entries in a directory have the same clear name, one shows with the
+  plain name and the other as `(conflict N)`. While the drive is mounted, an
+  entry keeps its name (plain or `(conflict N)`) as long as it exists: a new
+  entry with the same name, for example from another device, becomes a
+  conflict copy, and a freed plain name is not given to a copy until the
+  next mount. After a new mount the sort order of the real names decides.
+  The drive keeps these names in memory with the cached directories: if a
+  directory was not used for a long time while very many other directories
+  were listed (more than about 130 000 entries in total, for example by a
+  search index or a backup tool), the sort order decides for it again.
+  When the drive removes an incomplete directory (left by an interrupted
+  sync) that had the plain name, the next entry with that name gets it. A
+  rename over a name that has conflict copies replaces the entry shown under
+  that name and logs a warning.
 - An unreadable long-name entry is hidden from the listing and blocks creating
   other names in that directory that also need a long entry. An unreadable
   short entry blocks only its own name.

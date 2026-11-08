@@ -71,6 +71,17 @@ pub(crate) struct EntryRef {
     pub(crate) entry_id: EntryId,
     /// The epoch whose name key decrypted the name.
     pub(crate) epoch: Epoch,
+    /// The clear name of an entry shown under a conflict name; `None` for a
+    /// plain name and for entries of own changes.
+    pub(crate) conflict_of: Option<String>,
+}
+
+/// A display name of the last listing, kept for the next one (spec
+/// 2026-11-08 stable display names, 3.1).
+pub(crate) struct KeptName {
+    pub(crate) display: String,
+    /// The clear name of the entry.
+    pub(crate) clear: String,
 }
 
 /// What every state of one real directory shares (found by device, inode
@@ -100,6 +111,7 @@ impl SharedDir {
                 racy: is_racy(mtime, now),
                 version: 0,
                 listing: None,
+                previous: None,
             }),
             warned_extra_ids: AtomicBool::new(false),
         }
@@ -197,9 +209,39 @@ pub(crate) struct Index {
     version: u64,
     /// Built on first use; own changes update it in place.
     pub(crate) listing: Option<Listing>,
+    /// The display names of the last listing (real name to display name)
+    /// after it was dropped, so the next listing keeps them: an entry keeps
+    /// its name while the drive is mounted (spec 2026-11-08 stable display
+    /// names, 3.1). Names only, never used to find an entry.
+    pub(crate) previous: Option<HashMap<String, KeptName>>,
 }
 
 impl Index {
+    /// Drops the listing and keeps its display names in `previous`. Without
+    /// a listing an older `previous` stays.
+    pub(crate) fn drop_listing(&mut self) {
+        if let Some(l) = self.listing.take() {
+            self.previous = Some(
+                l.entries
+                    .into_iter()
+                    .map(|(display, e)| {
+                        let clear = e.conflict_of.unwrap_or_else(|| display.clone());
+                        (e.real, KeptName { display, clear })
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    /// Drops the listing and forgets the kept names of the clear name
+    /// `clear`, so the next listing names its entries by sort order again.
+    pub(crate) fn forget_names_of(&mut self, clear: &str) {
+        self.drop_listing();
+        if let Some(p) = &mut self.previous {
+            p.retain(|_, k| k.clear != clear);
+        }
+    }
+
     /// True if the mtime is racy and its window has passed: the listing
     /// must be built again to find a change of the same tick.
     pub(crate) fn check_due(&self, now: SystemTime) -> bool {
@@ -263,7 +305,7 @@ impl DirState {
 
     /// Drops the cached listing so the next use lists the directory again.
     pub(crate) fn forget_listing(&self) {
-        self.index().listing = None;
+        self.index().drop_listing();
     }
 
     /// The stored mtime of the real directory.
@@ -341,7 +383,11 @@ impl CryptoFs {
     /// counts as one entry.
     fn keep_shared(&self, state: &DirState) {
         let entries = match state.shared.index.try_lock() {
-            Ok(index) => index.listing.as_ref().map_or(0, |l| l.entries.len()),
+            Ok(index) => match (&index.listing, &index.previous) {
+                (Some(l), _) => l.entries.len(),
+                (None, Some(p)) => p.len(),
+                (None, None) => 0,
+            },
             Err(_) => 0,
         };
         self.kept_dirs
@@ -408,7 +454,7 @@ impl CryptoFs {
                 index.mtime = st.mtime;
                 index.racy = is_racy(st.mtime, now);
                 index.version += 1;
-                index.listing = None;
+                index.drop_listing();
             }
             index.version
         };
@@ -670,6 +716,7 @@ impl CryptoFs {
             layout,
             entry_id,
             epoch: self.keys.write_epoch(),
+            conflict_of: None,
         }
     }
 
@@ -690,8 +737,10 @@ impl CryptoFs {
                 // Gone (removed by `dir_state`, or from outside): look
                 // again, as the next entry with this name may now hold it
                 // (it was a conflict entry before). `dir_state` may have
-                // reset another state's listing, so reset this one.
-                Err(Error::NotFound) => parent.forget_listing(),
+                // reset another state's listing, so reset this one. An
+                // incomplete entry was never a real one, so its name is not
+                // kept for the conflict entries of the same name.
+                Err(Error::NotFound) => parent.index().forget_names_of(&display_key(name)),
                 Ok(_) => return Err(Error::AlreadyExists),
                 Err(e) => return Err(e),
             }
