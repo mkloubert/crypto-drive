@@ -278,11 +278,13 @@ sequential use is fine.
 
 If a sync client makes a conflict copy (for example `name (conflict copy)`),
 the drive shows it as `<name> (conflict N)<.ext>`. You can read and write it
-like any file. Rename it to resolve the conflict. If two devices create the
-same directory at the same time, the vault can get more than one `.cd-dir`.
-It still works. `check` reports it, and the mounted drive logs a warning. To
-clean it up, move the entries of that directory to a new directory in the
-drive (this names them under one id) and remove the old one.
+like any file. Rename it to resolve the conflict. A sync client may also make
+a copy of a `.cd-dir` file. Such a copy holds the same directory id and is
+harmless: `check` reports it as `multiple-dir-ids`, and you can delete it. A
+`.cd-dir` copy with another id does not come from a sync client: entries
+named under it are not shown, the mounted drive logs a warning (once per
+mount), and `check` reports `foreign-dir-id` as an error. If you see it, the
+vault was probably changed by someone else.
 
 ## Threat model
 
@@ -292,8 +294,11 @@ provider, stolen disk, backup):
 - Confidentiality of file contents and of file and directory names.
 - Integrity: a change is detected on read and gives an error, never wrong
   plaintext. This covers bit flips, swapped or cut chunks, chunks mixed
-  between files, and files moved between directories. Two gaps remain; see
-  "Not protected against" (older versions, extra `.cd-dir` copies).
+  between files. Files moved between directories are not accepted: they are
+  not shown in the other directory, also with a planted copy of a
+  `.cd-dir`, and `check` reports them (for you this looks like a deletion,
+  see "Not protected against"). One gap remains; see "Not protected
+  against" (older versions).
 - File and directory swaps are detected. The content of a file is bound to its
   name through a random entry id. If someone replaces the encrypted file `B`
   with a copy of another file `A`, you get an error, not A's content under B's
@@ -349,14 +354,6 @@ Not protected against:
   with a random 96-bit nonce. The usual limit for random nonces is 2^32
   writes per key; above it the risk of a nonce collision grows, and a
   collision would allow forged chunks of that file.
-- Moves between directories with a planted `.cd-dir` copy. Extra `.cd-dir`
-  files are allowed so that sync conflicts keep working (see "Cloud sync").
-  Someone who can change the vault can move files or directories from
-  directory A to directory B and put a copy of A's `.cd-dir` into B: the
-  entries then show up in B without an error. A mounted drive logs a warning
-  for such a directory (once per mount), and `check` reports it as
-  `multiple-dir-ids`. If you did not expect a sync conflict there, look at
-  the entries of that directory.
 - Deleting entries, or bringing back deleted ones. No directory listing is
   authenticated: someone who can change the vault can remove single files or
   whole directories, or put back an old, deleted file. Nothing reports it.
@@ -485,10 +482,13 @@ Not protected against:
   short entry blocks only its own name.
 - Entries left incomplete by an interrupted sync are hidden. `check` reports
   them.
-- A directory uses at most 16 directory ids: its own `.cd-dir` and the first
-  15 sync conflict copies of it (by name). Entries named under further
-  copies are hidden. Real sync conflicts make one or two copies; many more
-  point to a damaged or tampered vault. `check` reports every copy.
+- A directory uses only the id in its own `.cd-dir`. Entries named under
+  the id of a `.cd-dir` copy are hidden. `check` reports every copy. While a
+  directory holds a `.cd-dir` copy with another id, `rotate-key` does not
+  finish and keeps the old key, because the entries named under that copy
+  would be lost with it; the error names the copy. Run `check` to see the
+  hidden entries; when you remove the copy and run `rotate-key` again, they
+  can no longer be read.
 - A key file with more than 16 slots, over 64 KiB, or that is not a regular
   file is refused. A real key file has one slot and about 100 bytes.
 - A foreign file inside a real directory (for example `.DS_Store` after you

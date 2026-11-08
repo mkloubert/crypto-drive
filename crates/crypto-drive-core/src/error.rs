@@ -56,23 +56,40 @@ pub enum Error {
     /// The final check of a key rotation found entries of the old epoch.
     /// `hidden` are the real paths of long entries without a valid
     /// `.cd-name` that still hold data (they are counted in `left`).
-    #[error("{}", rotation_not_finished(*left, hidden))]
-    RotationNotFinished { left: u64, hidden: Vec<String> },
+    /// `foreign_copies` are the real paths of `.cd-dir` copies with another
+    /// id: entries named under them would be lost with the old key (spec
+    /// 2026-11-08 one dir id).
+    #[error("{}", rotation_not_finished(*left, hidden, foreign_copies))]
+    RotationNotFinished {
+        left: u64,
+        hidden: Vec<String>,
+        foreign_copies: Vec<String>,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-fn rotation_not_finished(left: u64, hidden: &[String]) -> String {
-    let mut text = format!("{left} entries still use the old key; run rotate-key again");
-    if !hidden.is_empty() {
-        text.push_str(&format!(
-            ". These long entries have no valid .cd-name but hold data, so the old key is kept: {}. Repair or remove them first",
-            hidden.join(", ")
+fn rotation_not_finished(left: u64, hidden: &[String], foreign_copies: &[String]) -> String {
+    let mut parts = Vec::new();
+    if left > 0 {
+        let mut text = format!("{left} entries still use the old key; run rotate-key again");
+        if !hidden.is_empty() {
+            text.push_str(&format!(
+                ". These long entries have no valid .cd-name but hold data, so the old key is kept: {}. Repair or remove them first",
+                hidden.join(", ")
+            ));
+        }
+        parts.push(text);
+    }
+    if !foreign_copies.is_empty() {
+        parts.push(format!(
+            "these .cd-dir copies hold another directory id, so entries named under them were not converted and the old key is kept: {}. Run crypto-drive check (foreign-dir-id) and remove the copies first",
+            foreign_copies.join(", ")
         ));
     }
-    text
+    parts.join("; ")
 }
 
 #[cfg(test)]
@@ -104,6 +121,7 @@ mod tests {
         let plain = Error::RotationNotFinished {
             left: 2,
             hidden: Vec::new(),
+            foreign_copies: Vec::new(),
         };
         assert_eq!(
             plain.to_string(),
@@ -112,8 +130,30 @@ mod tests {
         let hidden = Error::RotationNotFinished {
             left: 1,
             hidden: vec!["a/.cd-cdlX".into()],
+            foreign_copies: Vec::new(),
         };
         assert!(hidden.to_string().contains(": a/.cd-cdlX. Repair"));
+    }
+
+    #[test]
+    fn rotation_not_finished_names_foreign_copies() {
+        let only = Error::RotationNotFinished {
+            left: 0,
+            hidden: Vec::new(),
+            foreign_copies: vec!["b/.cd-dir 2".into()],
+        };
+        assert_eq!(
+            only.to_string(),
+            "these .cd-dir copies hold another directory id, so entries named under them were not converted and the old key is kept: b/.cd-dir 2. Run crypto-drive check (foreign-dir-id) and remove the copies first"
+        );
+        let both = Error::RotationNotFinished {
+            left: 2,
+            hidden: Vec::new(),
+            foreign_copies: vec!["b/.cd-dir 2".into()],
+        };
+        assert!(both.to_string().starts_with(
+            "2 entries still use the old key; run rotate-key again; these .cd-dir copies"
+        ));
     }
 
     #[test]

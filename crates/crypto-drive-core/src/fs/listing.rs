@@ -31,8 +31,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 thread_local! {
     /// Listings built by this thread (tests run each test in its own thread).
     static LISTINGS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Warnings about extra directory ids logged by this thread.
-    static EXTRA_ID_WARNINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Warnings about a `.cd-dir` copy with another id logged by this thread.
+    static FOREIGN_COPY_WARNINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// A short real name whose stat fails in this thread (a stat failure
     /// of one entry cannot be made portably on a real file system).
     static FAIL_STAT_OF: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -44,10 +44,11 @@ pub(crate) fn listings_built() -> usize {
     LISTINGS_BUILT.with(|c| c.get())
 }
 
-/// How many warnings about extra directory ids this thread has logged.
+/// How many warnings about a `.cd-dir` copy with another id this thread
+/// has logged.
 #[cfg(test)]
-pub(crate) fn extra_id_warnings() -> usize {
-    EXTRA_ID_WARNINGS.with(|c| c.get())
+pub(crate) fn foreign_copy_warnings() -> usize {
+    FOREIGN_COPY_WARNINGS.with(|c| c.get())
 }
 
 /// Makes the stat of the short real name `real` fail in this thread.
@@ -162,18 +163,15 @@ struct Found {
     layout: Layout,
     entry_id: EntryId,
     epoch: Epoch,
-    /// Index of the directory id that decrypted the name.
-    id_index: usize,
     /// True if the real name has a sync conflict suffix.
     conflict: bool,
 }
 
-/// A name that decrypted under one of the directory ids.
+/// A name that decrypted under the directory id.
 struct Decrypted {
     clear: String,
     entry_id: EntryId,
     epoch: Epoch,
-    id_index: usize,
 }
 
 impl Found {
@@ -184,7 +182,6 @@ impl Found {
             layout,
             entry_id: d.entry_id,
             epoch: d.epoch,
-            id_index: d.id_index,
             conflict,
         }
     }
@@ -237,18 +234,16 @@ impl CryptoFs {
         Ok(f(index.listing.insert(listing)))
     }
 
-    /// Decrypts with each directory id and each epoch; the first that
-    /// authenticates wins.
+    /// Decrypts with the directory id under each epoch; the first that
+    /// authenticates wins. Ids of `.cd-dir` copies are never tried (spec
+    /// 2026-11-08 one dir id).
     fn decrypt_name(&self, state: &DirState, encoded: &str) -> Option<Decrypted> {
-        state.dir_ids.iter().enumerate().find_map(|(id_index, id)| {
-            let (epoch, entry_id, clear) = self.names.decrypt_any(id, encoded)?;
-            validate_name(&clear).ok()?;
-            Some(Decrypted {
-                clear,
-                entry_id,
-                epoch,
-                id_index,
-            })
+        let (epoch, entry_id, clear) = self.names.decrypt_any(&state.dir_id, encoded)?;
+        validate_name(&clear).ok()?;
+        Some(Decrypted {
+            clear,
+            entry_id,
+            epoch,
         })
     }
 
@@ -341,7 +336,7 @@ impl CryptoFs {
                 }
             }
         }
-        warn_extra_ids(state, &normal, &conflicts);
+        warn_foreign_copy(state);
         let mut entries = BTreeMap::new();
         let previous_of = |f: &Found| previous.and_then(|p| p.get(&f.real)).map(|k| &k.display);
         // 1. An entry that had the plain name keeps it.
@@ -352,13 +347,13 @@ impl CryptoFs {
             entries.insert(f.clear.clone(), f.into_entry());
         }
         // 2. An entry that had a conflict name keeps that one (step 3), also
-        // when the plain name is free now. The same clear name under two
-        // directory ids: the one `find` would pick first gets the name, the
-        // others become conflict entries.
+        // when the plain name is free now. New entries with the same clear
+        // name: the first by real name gets the name, the others become
+        // conflict entries.
         let (had_conflict_name, mut new): (Vec<Found>, Vec<Found>) =
             rest.into_iter().partition(|f| previous_of(f).is_some());
         conflicts.extend(had_conflict_name);
-        new.sort_by(|a, b| (a.id_index, &a.real).cmp(&(b.id_index, &b.real)));
+        new.sort_by(|a, b| a.real.cmp(&b.real));
         for f in new {
             match entries.entry(f.clear.clone()) {
                 btree_map::Entry::Vacant(slot) => {
@@ -396,24 +391,22 @@ impl CryptoFs {
     }
 }
 
-/// Logs a warning (once per real directory) if entries only decrypt under an
-/// extra directory id, the id of a `.cd-dir` copy. A sync merge makes such
-/// entries, but so can an attacker who puts a copy of another directory's
-/// `.cd-dir` next to entries moved from there: the move is not detected.
-fn warn_extra_ids(state: &DirState, normal: &[Found], conflicts: &[Found]) {
-    let extra = normal
-        .iter()
-        .chain(conflicts)
-        .filter(|f| f.id_index > 0)
-        .count();
-    if extra == 0 || !state.first_extra_id_warning() {
+/// Logs a warning (once per real directory) if a `.cd-dir` copy holds
+/// another id. A sync client only makes copies with the same id; one with
+/// another id may come from an attacker who moved entries here from
+/// another directory. Entries named under it are not shown. Only the real
+/// name is logged.
+fn warn_foreign_copy(state: &DirState) {
+    let Some(real) = &state.foreign_copy else {
+        return;
+    };
+    if !state.first_foreign_copy_warning() {
         return;
     }
     #[cfg(test)]
-    EXTRA_ID_WARNINGS.with(|c| c.set(c.get() + 1));
+    FOREIGN_COPY_WARNINGS.with(|c| c.set(c.get() + 1));
     log::warn!(
-        "{extra} entries in one directory are named under the id of a .cd-dir copy, not under its own id. \
-         A sync conflict makes this, but they may also have been moved here from another directory \
-         without being noticed. Run `crypto-drive check` to find the copy (multiple-dir-ids)."
+        "a .cd-dir copy in {real} holds another directory id; entries named under it are not shown. \
+         Run crypto-drive check (foreign-dir-id)."
     );
 }

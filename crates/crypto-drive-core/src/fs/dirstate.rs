@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Directory state: handle, directory ids and cached listing (spec 5.2).
+//! Directory state: handle, directory id and cached listing (spec 5.2;
+//! one id per directory: spec 2026-11-08 one dir id).
 
 use super::CryptoFs;
 use super::listing::{Layout, Listing};
@@ -95,9 +96,9 @@ pub(crate) struct SharedDir {
     change: Mutex<()>,
     /// The name index and the mtime it belongs to. A leaf lock.
     index: Mutex<Index>,
-    /// Set after the warning about entries named under an extra directory
-    /// id was logged, so it is logged once per real directory.
-    warned_extra_ids: AtomicBool,
+    /// Set after the warning about a `.cd-dir` copy with another id was
+    /// logged, so it is logged once per real directory.
+    warned_foreign_copy: AtomicBool,
 }
 
 impl SharedDir {
@@ -113,7 +114,7 @@ impl SharedDir {
                 listing: None,
                 previous: None,
             }),
-            warned_extra_ids: AtomicBool::new(false),
+            warned_foreign_copy: AtomicBool::new(false),
         }
     }
 }
@@ -262,8 +263,12 @@ impl Index {
 /// What is known about one real directory.
 pub(crate) struct DirState {
     pub(crate) handle: Arc<DirHandle>,
-    /// Never empty. The canonical id from `.cd-dir` comes first.
-    pub(crate) dir_ids: Vec<DirId>,
+    /// The id from `.cd-dir` (the `vault_id` for the root): the only id
+    /// used to decrypt the names of the children.
+    pub(crate) dir_id: DirId,
+    /// The real name of this directory if a `.cd-dir` copy in it holds
+    /// another id (for the warning).
+    pub(crate) foreign_copy: Option<String>,
     shared: Arc<SharedDir>,
     /// The key of `shared` in `shared_dirs`.
     shared_key: SharedKey,
@@ -278,13 +283,15 @@ pub(crate) struct DirState {
 impl DirState {
     /// The id for new entries.
     pub(crate) fn canonical_id(&self) -> &DirId {
-        // `dir_ids` is never empty (see the field).
-        &self.dir_ids[0]
+        &self.dir_id
     }
 
     /// True the first time it is called for this real directory.
-    pub(crate) fn first_extra_id_warning(&self) -> bool {
-        !self.shared.warned_extra_ids.swap(true, Ordering::Relaxed)
+    pub(crate) fn first_foreign_copy_warning(&self) -> bool {
+        !self
+            .shared
+            .warned_foreign_copy
+            .swap(true, Ordering::Relaxed)
     }
 
     /// Device and inode of the real directory.
@@ -580,7 +587,8 @@ impl CryptoFs {
             self.shared_dir(&self.root.stat_self()?, &self.root_id, now);
         let state = Arc::new(DirState {
             handle: Arc::clone(&self.root),
-            dir_ids: vec![self.root_id],
+            dir_id: self.root_id,
+            foreign_copy: None,
             shared,
             shared_key,
             version,
@@ -614,7 +622,7 @@ impl CryptoFs {
                 mtime,
             ));
         }
-        let dir_ids = match read_dir_ids(&handle, &entry.real, &names) {
+        let ids = match read_dir_id(&handle, &entry.real, &names) {
             Ok(ids) => ids,
             // An empty `.cd-dir` is what a crash after a deferred mkdir can
             // leave (the rename survived, the data not): it counts as a
@@ -637,13 +645,14 @@ impl CryptoFs {
         };
         // The canonical id must be the entry id of the name (HS 3.2), or
         // this is the subtree of another directory under this name.
-        if dir_ids[0] != entry.entry_id {
+        if ids.id != entry.entry_id {
             return Err(Error::AuthFailed { what: entry.real });
         }
-        let (shared, shared_key, version) = self.shared_dir(&st, &dir_ids[0], now);
+        let (shared, shared_key, version) = self.shared_dir(&st, &ids.id, now);
         Ok(Arc::new(DirState {
             handle: Arc::new(handle),
-            dir_ids,
+            dir_id: ids.id,
+            foreign_copy: ids.foreign_copy.then_some(entry.real),
             shared,
             shared_key,
             version,
@@ -768,48 +777,84 @@ impl CryptoFs {
     }
 }
 
-/// Most directory ids used for one real directory: the canonical one and
-/// the first copies by name. Copies are allowed for sync conflicts (a
-/// handful at most); each listing tries every name with every id, so
-/// thousands of planted copies would make a listing take minutes. Names
-/// under the other copies stay hidden; `check` reports every copy.
-pub const MAX_DIR_IDS: usize = 16;
+/// At most this many `.cd-dir` copies are read per directory, in name
+/// order, so thousands of planted copies cost nothing. A copy only decides
+/// whether the drive warns; it never gives an id (spec 2026-11-08 one dir
+/// id, 3.1).
+pub const MAX_DIR_ID_COPIES: usize = 16;
 
-/// Reads the canonical `.cd-dir` and the ids of its sync conflict copies.
-pub(crate) fn read_dir_ids(handle: &DirHandle, real: &str, names: &[String]) -> Result<Vec<DirId>> {
+/// The id of a real directory from its `.cd-dir`.
+pub(crate) struct DirIds {
+    /// The id in `.cd-dir`, the only one used to decrypt names.
+    pub(crate) id: DirId,
+    /// True if a `.cd-dir` copy (a regular file of 16 bytes) holds another
+    /// id. A sync client only makes copies with the same id.
+    pub(crate) foreign_copy: bool,
+}
+
+/// Reads the canonical `.cd-dir` and looks at its sync conflict copies.
+pub(crate) fn read_dir_id(handle: &DirHandle, real: &str, names: &[String]) -> Result<DirIds> {
     let bytes = handle.read_small(DIR_FILE, DIR_ID_LEN)?;
-    let canonical: DirId = bytes
+    let id: DirId = bytes
         .try_into()
         .map_err(|_| invalid(format!("{real}/{DIR_FILE}")))?;
-    let mut ids = vec![canonical];
-    // In name order, so the same copies are used on every listing.
-    let mut copies: Vec<&String> = names
-        .iter()
-        .filter(|n| *n != DIR_FILE && *n != DIR_TMP_FILE && n.starts_with(DIR_FILE))
-        .collect();
+    let mut copies: Vec<&String> = names.iter().filter(|n| is_dir_id_copy_name(n)).collect();
     copies.sort();
-    for n in copies {
-        if ids.len() >= MAX_DIR_IDS {
-            break;
-        }
+    for n in copies.into_iter().take(MAX_DIR_ID_COPIES) {
         // Only regular files of exactly 16 bytes count; anything else is
         // ignored here and reported by `check`.
-        if !matches!(handle.stat(n), Ok(st) if st.kind == Kind::File) {
+        let Some(copy) = read_copy(handle, n)? else {
             continue;
-        }
-        let id: DirId = match handle.read_small(n, DIR_ID_LEN) {
-            Ok(b) => match b.try_into() {
-                Ok(id) => id,
-                Err(_) => continue,
-            },
-            Err(Error::NotFound | Error::InvalidFormat { .. }) => continue,
-            Err(e) => return Err(e),
         };
-        if !ids.contains(&id) {
-            ids.push(id);
+        if copy != id {
+            return Ok(DirIds {
+                id,
+                foreign_copy: true,
+            });
         }
     }
-    Ok(ids)
+    Ok(DirIds {
+        id,
+        foreign_copy: false,
+    })
+}
+
+/// The names of all `.cd-dir` copies in `names` (regular files of 16 bytes)
+/// whose id is not `id`, in name order. For the final check of
+/// `rotate-key`, which runs offline and reads every copy.
+pub(crate) fn foreign_dir_id_copies(
+    handle: &DirHandle,
+    id: &DirId,
+    names: &[String],
+) -> Result<Vec<String>> {
+    let mut copies: Vec<&String> = names.iter().filter(|n| is_dir_id_copy_name(n)).collect();
+    copies.sort();
+    let mut out = Vec::new();
+    for n in copies {
+        if let Some(copy) = read_copy(handle, n)?
+            && copy != *id
+        {
+            out.push(n.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// True for the name of a `.cd-dir` conflict copy.
+fn is_dir_id_copy_name(n: &str) -> bool {
+    n != DIR_FILE && n != DIR_TMP_FILE && n.starts_with(DIR_FILE)
+}
+
+/// The id in the copy `n`; `None` if it is not a regular file of 16 bytes.
+fn read_copy(handle: &DirHandle, n: &str) -> Result<Option<DirId>> {
+    if !matches!(handle.stat(n), Ok(st) if st.kind == Kind::File) {
+        return Ok(None);
+    }
+    match handle.read_small(n, DIR_ID_LEN) {
+        Ok(b) => Ok(b.try_into().ok()),
+        Err(Error::NotFound | Error::InvalidFormat { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Handles a directory without `.cd-dir` (spec 5.5). If it is empty or holds

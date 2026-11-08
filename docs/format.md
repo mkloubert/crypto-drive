@@ -211,11 +211,13 @@ name  = B64(enc)
 - File: the `file_id` in the file header MUST equal the entry id in the name.
   If not, a reader MUST fail with an authentication error.
 - Directory: the canonical `.cd-dir` MUST hold the entry id in the name. If
-  not, a reader MUST fail with an authentication error. Extra `.cd-dir`
-  conflict copies (section 10) stay readable for children, but the canonical
-  one decides the binding. Because of this, a move of entries from directory
-  A to directory B is not detected if a copy of A's `.cd-dir` is put into B.
-  A reader SHOULD warn when a name only decrypts under an extra ID.
+  not, a reader MUST fail with an authentication error. The canonical
+  `.cd-dir` is the only id of the directory: a reader MUST NOT decrypt names
+  under the id of a `.cd-dir` copy (section 10). So entries moved from
+  directory A to directory B are not accepted in B, also when a copy of A's
+  `.cd-dir` is put into B: they do not decrypt there, so they are not shown,
+  and a checker reports them. For the user this looks like a deletion from
+  A (section 8).
 - Rename and move MUST encrypt the name again with the same entry id. They
   MUST NOT change content or `.cd-dir`.
 - A copy MUST get a new `file_id`.
@@ -362,13 +364,15 @@ A reader MUST handle this as follows:
      already gave while those entries exist. No pattern per sync client is used.
    - Anything else is foreign and MUST be hidden.
 3. More than one `.cd-dir`: a control file whose name starts with `.cd-dir`
-   and that is 16 bytes long (except `.cd-dir.tmp`) is a conflict copy of the
-   directory ID. A reader MUST try the canonical ID and the IDs of the first
-   15 copies in byte order of their names (16 distinct IDs at most) when it
-   decrypts names. It MUST ignore further copies, so that planted copies
-   cannot make a listing try every name with thousands of IDs; names under
-   them are not shown. A check tool SHOULD report every copy. A writer MUST
-   use the canonical `.cd-dir` for new entries.
+   and that is 16 bytes long (except `.cd-dir.tmp`) is a conflict copy. A
+   sync client can only make copies with the same ID, because `.cd-dir`
+   never changes and the ID is also the entry ID in the directory's name. A
+   reader MUST use only the canonical `.cd-dir` to decrypt names; it MUST
+   NOT use the ID of a copy, so names under another ID are not shown. A
+   reader SHOULD warn about a copy with another ID and SHOULD NOT read more
+   than a few copies for this. A check tool SHOULD report every copy, and a
+   copy with another ID as an error. A writer MUST use the canonical
+   `.cd-dir` for new entries.
 
 Conflict copies are normal files. Renaming one encrypts its name again with a
 clean name and so resolves the conflict.

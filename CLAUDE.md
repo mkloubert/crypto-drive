@@ -7,7 +7,8 @@ commit `2ef9857`, full review in `REPORT.md`). Last change: 2026-11-08
 R1 + R2 never drop buffered data, P1 kept listings, P4-a + P5-b fewer
 syncs; new review SEC-/ROB-/PERF- ids; coarse-mtime fix after the first
 Debian 13 test run; new file key on a cut to size 0, SEC-4 part; stable
-display names of same-name entries, ROB-1).
+display names of same-name entries, ROB-1; one directory id per directory,
+SEC-5).
 
 ## 0. Rules for Claude (always)
 
@@ -148,7 +149,7 @@ without a mount.
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
 | `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. Every flush runs `check_space` first (`space_needed`: growth + every rewritten chunk, an upper bound for copy-on-write file systems); `write` flushes **before** it takes data that would overflow the buffer, so a failed write changes nothing. `truncate(len, keys)`: a cut to size 0 makes a new header (new `file_nonce`, same `file_id`, write epoch; `header_dirty` until the next flush writes it; meanwhile `disk_len` is 0, `load_chunk` reads nothing from disk and a failed grow leaves an empty file with the new header), so chunks of older versions no longer authenticate (SEC-4). Test hooks: `fail_chunk_writes_after`, `fake_free_space`. |
-| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd; a state that leaves it hands its `SharedDir` with the listing to `KeptDirs`, an fd-free LRU bounded by listing entries `KEPT_DIR_ENTRIES` 131 072, about 25 MiB; review P1): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index; racy mtimes: a mtime younger than `RACY_WINDOW` 2 s is checked once more after the window), `listing.rs` (readdir + conflict copies; display names are kept while mounted: `Index::previous` real name → `KeptName`, filled by `drop_listing`, used first by `build_listing`; `ensure_free` drops the kept names of a removed incomplete dir via `forget_names_of`; `EntryRef::conflict_of`), `dirs.rs`, `files.rs`, `rename.rs` (a rename over an entry with conflict copies logs a `warn` with the real name; test counter `replace_warnings`), `unsynced.rs` (which real directories need a sync; review P4-a / P5-b). |
+| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd; a state that leaves it hands its `SharedDir` with the listing to `KeptDirs`, an fd-free LRU bounded by listing entries `KEPT_DIR_ENTRIES` 131 072, about 25 MiB; review P1): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle; `read_dir_id` → `DirIds { id, foreign_copy }`: only the canonical `.cd-dir` id decrypts names, copies never give an id, at most `MAX_DIR_ID_COPIES` 16 copies are read for the foreign-copy warning; also used by rotation and the vault walks of `recover` / `rotate-key`; name index; racy mtimes: a mtime younger than `RACY_WINDOW` 2 s is checked once more after the window), `listing.rs` (readdir + conflict copies; display names are kept while mounted: `Index::previous` real name → `KeptName`, filled by `drop_listing`, used first by `build_listing`; `ensure_free` drops the kept names of a removed incomplete dir via `forget_names_of`; `EntryRef::conflict_of`), `dirs.rs`, `files.rs`, `rename.rs` (a rename over an entry with conflict copies logs a `warn` with the real name; test counter `replace_warnings`), `unsynced.rs` (which real directories need a sync; review P4-a / P5-b). |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
 | `rotate` | Offline, resumable master key rotation. |
@@ -392,7 +393,7 @@ State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
 10 ignored. After S2: 520 passed, 0 failed, 10 ignored. After S3: 524 passed,
-0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored. After P4-a + P5-b: 548 passed, 0 failed, 10 ignored. After the coarse-mtime fix: 553 passed, 0 failed, 10 ignored. After the new key on a cut to size 0: 562 passed, 0 failed, 10 ignored. After the stable display names: 571 passed, 0 failed, 10 ignored.
+0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored. After P4-a + P5-b: 548 passed, 0 failed, 10 ignored. After the coarse-mtime fix: 553 passed, 0 failed, 10 ignored. After the new key on a cut to size 0: 562 passed, 0 failed, 10 ignored. After the stable display names: 571 passed, 0 failed, 10 ignored. After one dir id per directory: 576 passed, 0 failed, 10 ignored.
 
 ## 8. Platform notes
 
@@ -423,8 +424,9 @@ tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
 
 No rollback detection; chunk mixing between versions of the same file is
 not detected while it is written in place without a cut to size 0
-(databases, VM images; a cut to 0 gives a new key); an extra `.cd-dir` copy allows undetected moves between
-directories (warning + `check` finding `multiple-dir-ids`); xattrs in memory
+(databases, VM images; a cut to 0 gives a new key); entries under a
+`.cd-dir` copy with another id are hidden (warning + `check` error
+`foreign-dir-id`); xattrs in memory
 only; no symlinks / hard links / chown; rename replace is not atomic; `check`
 does not repair; deleting or bringing back entries is not detected; visible
 metadata: exact name length, clear file / dir ids (stable across rename,
@@ -526,7 +528,7 @@ and "Limits", `docs/format.md` section 8 notes.
   step 11 "busy stop", to run on the Mac). `passwd` takes the vault lock (owner decision: race free beats `passwd`
   while mounted). Known gaps documented in README, `docs/format.md` section 8 and the
   GitHub page. Time-based flush of dirty chunks done (core + mount thread, container
-  only). Caps for hostile input done (`MAX_DIR_IDS`, key file slots and size;
+  only). Caps for hostile input done (`MAX_DIR_IDS`, now `MAX_DIR_ID_COPIES`, key file slots and size;
   reader limits in `docs/format.md` 3.1 and 10).
 - Review 2026-11-08 (second full review, commit `2ef9857`) in untracked
   `REPORT.md`: ids `SEC-*`, `ROB-*`, `PERF-*`, five next steps per area in
@@ -590,8 +592,7 @@ and "Limits", `docs/format.md` section 8 notes.
   version change, `docs/format.md` 7 (SHOULD rule) and 11 (exception),
   README threat model (mixing only for in-place writes, nonce budget),
   GitHub page. Remaining SEC-4 part: files written in place keep one key.
-  Next from the criticality list: SEC-5, SEC-2, `passwd` hint to
-  `rotate-key`.
+  Next from the criticality list: SEC-2, `passwd` hint to `rotate-key`.
 - Stable display names (ROB-1) done 2026-11-08, not yet committed, Linux
   container only (spec
   `docs/superpowers/specs/2026-11-08-stable-display-names-design.md`, plan
@@ -604,6 +605,22 @@ and "Limits", `docs/format.md` section 8 notes.
   name is literally a kept conflict name takes it (owner decision); the
   warning check can fail a rename on a second listing error; names of new
   entries are not kept while a listing is never stored.
+- One directory id per directory (SEC-5) done 2026-11-08, not yet
+  committed, Linux container only (spec
+  `docs/superpowers/specs/2026-11-08-one-dir-id-design.md`, plan
+  `docs/superpowers/plans/2026-11-08-one-dir-id.md`; owner decisions:
+  entries under a copy with another id are hidden, the directory works;
+  `check` error `foreign-dir-id`, a same-id copy stays the warning
+  `multiple-dir-ids`; no vaults from before the format hardening exist):
+  drive, `check`, `rotate-key` and the vault walks use only the canonical
+  id; `rotate-key` no longer adopts moved entries and does not finish
+  while a `.cd-dir` copy with another id exists
+  (`RotationNotFinished.foreign_copies` names it). Deferred from the final
+  review: 16 junk copies hide the drive warning; `recover` with a planted
+  name under a foreign id fails `WrongKey` without naming it; the warning
+  names only the last real component; rmdir gives ENOTEMPTY for such a dir. `docs/format.md` 6.1 and 10 item 3 (MUST
+  NOT use a copy's id), README (threat model gap removed, sync section,
+  limit), GitHub page item removed.
 - Open: per-flush file key (format change, would fix
   chunk mixing for in-place writes); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;

@@ -27,7 +27,7 @@ use crate::content::CHUNK_SIZE;
 use crate::error::{Error, Result};
 use crate::file::{OpenFile, header_epoch};
 use crate::fs::dirs::{MODE_MASK, ok_if_missing, remove_file_entry};
-use crate::fs::dirstate::{EntryRef, NAME_TMP_FILE, read_dir_ids};
+use crate::fs::dirstate::{EntryRef, NAME_TMP_FILE, foreign_dir_id_copies, read_dir_id};
 use crate::fs::listing::{Layout, long_layout, open_entry_dir, read_long_name};
 use crate::fs::rename::{move_entry, move_into_long_file, write_name};
 use crate::keyfile::{Argon2Params, KeyFile};
@@ -174,13 +174,18 @@ pub fn rotate_key(
         progress,
     };
     let root = DirHandle::open_root(vault_dir)?;
-    let root_ids = [marker.vault_id];
-    rot.walk_dir(&root, &root_ids)?;
+    let root_id = marker.vault_id;
+    rot.walk_dir(&root, &root_id)?;
 
     let mut hidden = Vec::new();
-    let left = rot.count_old(&root, &root_ids, "", &mut hidden)?;
-    if left > 0 {
-        return Err(Error::RotationNotFinished { left, hidden });
+    let mut foreign_copies = Vec::new();
+    let left = rot.count_old(&root, &root_id, "", &mut hidden, &mut foreign_copies)?;
+    if left > 0 || !foreign_copies.is_empty() {
+        return Err(Error::RotationNotFinished {
+            left,
+            hidden,
+            foreign_copies,
+        });
     }
     let new_marker = VaultMarker {
         epoch: new,
@@ -298,12 +303,12 @@ impl Rotation<'_> {
         (self.progress)(self.done);
     }
 
-    fn decrypt(&self, ids: &[DirId], encoded: &str) -> Option<(Epoch, EntryId, String, DirId)> {
-        ids.iter().find_map(|id| {
-            let (epoch, entry_id, clear) = self.names.decrypt_any(id, encoded)?;
-            validate_name(&clear).ok()?;
-            Some((epoch, entry_id, clear, *id))
-        })
+    /// Decrypts a name under the directory id `id` (never under the id of
+    /// a `.cd-dir` copy, spec 2026-11-08 one dir id), with every epoch.
+    fn decrypt(&self, id: &DirId, encoded: &str) -> Option<(Epoch, EntryId, String, DirId)> {
+        let (epoch, entry_id, clear) = self.names.decrypt_any(id, encoded)?;
+        validate_name(&clear).ok()?;
+        Some((epoch, entry_id, clear, *id))
     }
 
     /// The real name of `f` under the new epoch, with the same parent id,
@@ -328,7 +333,7 @@ impl Rotation<'_> {
     fn classify(
         &self,
         dir: &DirHandle,
-        ids: &[DirId],
+        id: &DirId,
         real: &str,
         repair: bool,
     ) -> Result<Option<Found>> {
@@ -343,7 +348,7 @@ impl Rotation<'_> {
                 }
                 return Ok(None);
             };
-            let Some((epoch, entry_id, clear, parent_id)) = self.decrypt(ids, &full) else {
+            let Some((epoch, entry_id, clear, parent_id)) = self.decrypt(id, &full) else {
                 return Ok(None);
             };
             let layout = long_layout(&entry_dir)?;
@@ -378,7 +383,7 @@ impl Rotation<'_> {
         }
         let Some(((epoch, entry_id, clear, parent_id), suffix)) = short_candidates(real)
             .into_iter()
-            .find_map(|(prefix, suffix)| Some((self.decrypt(ids, prefix)?, suffix)))
+            .find_map(|(prefix, suffix)| Some((self.decrypt(id, prefix)?, suffix)))
         else {
             return Ok(None);
         };
@@ -404,34 +409,34 @@ impl Rotation<'_> {
     }
 
     /// All entries of `dir` whose name decrypts, sorted by real name.
-    fn list(&self, dir: &DirHandle, ids: &[DirId], repair: bool) -> Result<Vec<Found>> {
+    fn list(&self, dir: &DirHandle, id: &DirId, repair: bool) -> Result<Vec<Found>> {
         let mut names = dir.list()?;
         names.sort();
         let mut found = Vec::new();
         for real in &names {
-            if let Some(f) = self.classify(dir, ids, real, repair)? {
+            if let Some(f) = self.classify(dir, id, real, repair)? {
                 found.push(f);
             }
         }
         Ok(found)
     }
 
-    /// Opens the real directory of a directory entry and reads its ids.
+    /// Opens the real directory of a directory entry and reads its id.
     /// `None` if it has no `.cd-dir` (its children cannot be read).
-    fn open_child(&self, dir: &DirHandle, real: &str) -> Result<Option<(DirHandle, Vec<DirId>)>> {
+    fn open_child(&self, dir: &DirHandle, real: &str) -> Result<Option<(DirHandle, DirId)>> {
         let child = dir.open_dir(real)?;
         let names = child.list()?;
-        match read_dir_ids(&child, real, &names) {
-            Ok(ids) => Ok(Some((child, ids))),
+        match read_dir_id(&child, real, &names) {
+            Ok(ids) => Ok(Some((child, ids.id))),
             Err(Error::NotFound | Error::InvalidFormat { .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
     /// Re-encrypts every entry of `dir` and below (HS 9.2 step 2).
-    fn walk_dir(&mut self, dir: &DirHandle, ids: &[DirId]) -> Result<()> {
+    fn walk_dir(&mut self, dir: &DirHandle, id: &DirId) -> Result<()> {
         ok_if_missing(dir.unlink(ROT_TMP_FILE))?;
-        let entries = self.list(dir, ids, true)?;
+        let entries = self.list(dir, id, true)?;
         let complete: HashSet<&str> = entries
             .iter()
             .filter(|f| f.name_matches && f.layout.is_some())
@@ -506,7 +511,7 @@ impl Rotation<'_> {
 
     fn walk_child(&mut self, dir: &DirHandle, real: &str) -> Result<()> {
         match self.open_child(dir, real)? {
-            Some((child, ids)) => self.walk_dir(&child, &ids),
+            Some((child, id)) => self.walk_dir(&child, &id),
             None => Ok(()),
         }
     }
@@ -772,7 +777,7 @@ impl Rotation<'_> {
     /// not readable, or it does not decrypt) that still holds `.cd-dir` or
     /// `.cd-content`. A crashed rename can leave one; its data would be
     /// lost with the old key, so it blocks the finish (HS 9.4).
-    fn is_hidden_data(&self, dir: &DirHandle, ids: &[DirId], real: &str) -> Result<bool> {
+    fn is_hidden_data(&self, dir: &DirHandle, id: &DirId, real: &str) -> Result<bool> {
         if long_candidate(real).is_none() {
             return Ok(false);
         }
@@ -783,7 +788,7 @@ impl Rotation<'_> {
             return Ok(false);
         }
         Ok(match read_long_name(&entry) {
-            Ok(Some(full)) => self.decrypt(ids, &full).is_none(),
+            Ok(Some(full)) => self.decrypt(id, &full).is_none(),
             Ok(None) | Err(Error::InvalidFormat { .. }) => true,
             Err(e) => return Err(e),
         })
@@ -796,9 +801,10 @@ impl Rotation<'_> {
     fn count_old(
         &self,
         dir: &DirHandle,
-        ids: &[DirId],
+        id: &DirId,
         path: &str,
         hidden: &mut Vec<String>,
+        foreign_copies: &mut Vec<String>,
     ) -> Result<u64> {
         let join = |real: &str| {
             if path.is_empty() {
@@ -811,12 +817,17 @@ impl Rotation<'_> {
         let mut names = dir.list()?;
         names.sort();
         for real in &names {
-            if self.is_hidden_data(dir, ids, real)? {
+            if self.is_hidden_data(dir, id, real)? {
                 hidden.push(join(real));
                 left += 1;
             }
         }
-        for f in self.list(dir, ids, false)? {
+        // Entries named under the id of a foreign copy cannot be converted
+        // and would be lost with the old key: the old key stays.
+        for copy in foreign_dir_id_copies(dir, id, &names)? {
+            foreign_copies.push(join(&copy));
+        }
+        for f in self.list(dir, id, false)? {
             let Some(layout) = f.layout else {
                 continue;
             };
@@ -828,8 +839,8 @@ impl Rotation<'_> {
             } else if f.epoch == self.old {
                 left += 1;
             } else if layout.is_dir() {
-                if let Some((child, ids)) = self.open_child(dir, &f.real)? {
-                    left += self.count_old(&child, &ids, &join(&f.real), hidden)?;
+                if let Some((child, id)) = self.open_child(dir, &f.real)? {
+                    left += self.count_old(&child, &id, &join(&f.real), hidden, foreign_copies)?;
                 }
             } else if self.content_of(dir, &f, layout)?.header_epoch(dir)? == Some(self.old) {
                 left += 1;

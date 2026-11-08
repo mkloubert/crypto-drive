@@ -233,7 +233,7 @@ mod tests {
     use crate::names::{LONG_PREFIX, NameKeys};
     use crate::testutil::{real_name_of, test_vault, test_vault_with};
     use crate::vault::{CONTROL_PREFIX, DIR_FILE, NAME_FILE, open_with_master_key};
-    use dirstate::MAX_DIR_IDS;
+    use dirstate::MAX_DIR_ID_COPIES;
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
 
@@ -700,70 +700,57 @@ mod tests {
     }
 
     #[test]
-    fn two_dir_ids_are_both_used() {
+    fn same_id_copy_is_harmless() {
         let f = fx();
         f.fs.mkdir(&p("d"), 0o755).unwrap();
         f.fs.mkdir(&p("d/c"), 0o755).unwrap();
         let real_d = f.real("d");
-        // A merged directory of another device: its `.cd-dir` became a
-        // conflict copy, and its child "e" is named under that id.
-        let other: DirId = crate::secret::random_bytes::<16>().unwrap();
-        std::fs::write(real_d.join(".cd-dir (conflicted copy)"), other).unwrap();
-        let e_id: DirId = crate::secret::random_bytes::<16>().unwrap();
-        let e = f.names.encrypt_write(&other, &e_id, "e").unwrap();
-        std::fs::create_dir(real_d.join(&e)).unwrap();
-        std::fs::write(real_d.join(&e).join(DIR_FILE), e_id).unwrap();
+        // A sync client's copy of `.cd-dir`: the same 16 bytes.
+        std::fs::copy(
+            real_d.join(DIR_FILE),
+            real_d.join(".cd-dir (conflicted copy)"),
+        )
+        .unwrap();
         std::fs::write(real_d.join(".cd-dir.tmp"), [0u8; 16]).unwrap();
         f.fs.advance_clock(dirstate::RACY_WINDOW);
+        let before = listing::foreign_copy_warnings();
         f.fs.mkdir(&p("d/g"), 0o755).unwrap();
-        assert_eq!(listed(&f.fs, "d"), vec!["c", "e", "g"]);
-        assert_eq!(f.fs.getattr(&p("d/c")).unwrap().kind, FileKind::Directory);
-        assert_eq!(f.fs.getattr(&p("d/e")).unwrap().kind, FileKind::Directory);
-        assert!(f.fs.readdir(&p("d/e")).unwrap().is_empty());
-        // New entries use the canonical id.
-        let canonical: DirId = std::fs::read(real_d.join(DIR_FILE))
-            .unwrap()
-            .try_into()
-            .unwrap();
-        real_name_of(&f.names, &canonical, &real_d, "g");
+        assert_eq!(listed(&f.fs, "d"), vec!["c", "g"]);
+        assert_eq!(listing::foreign_copy_warnings(), before);
     }
 
-    /// Thousands of planted `.cd-dir` copies must not make a listing try
-    /// every name with every id. Only the canonical id and the first
-    /// copies (by name) are used; names under the others stay hidden.
+    /// Thousands of planted `.cd-dir` copies cost nothing: at most
+    /// `MAX_DIR_ID_COPIES` are read, and no copy gives an id.
     #[test]
-    fn dir_id_copies_are_capped() {
+    fn many_dir_id_copies_are_cheap() {
         let f = fx();
         f.fs.mkdir(&p("d"), 0o755).unwrap();
         let real_d = f.real("d");
-        let mut copies = Vec::new();
-        for i in 0..MAX_DIR_IDS + 4 {
-            let id: DirId = crate::secret::random_bytes::<16>().unwrap();
+        let own = std::fs::read(real_d.join(DIR_FILE)).unwrap();
+        for i in 0..MAX_DIR_ID_COPIES + 4 {
             // Zero padded, so the name order is the number order.
-            std::fs::write(real_d.join(format!(".cd-dir (conflict {i:03})")), id).unwrap();
-            copies.push(id);
+            std::fs::write(real_d.join(format!(".cd-dir (conflict {i:03})")), &own).unwrap();
         }
-        let name_under = |id: &DirId, name: &str| {
-            let entry_id: DirId = crate::secret::random_bytes::<16>().unwrap();
-            let real = f.names.encrypt_write(id, &entry_id, name).unwrap();
-            std::fs::create_dir(real_d.join(&real)).unwrap();
-            std::fs::write(real_d.join(&real).join(DIR_FILE), entry_id).unwrap();
-        };
-        // The last copy that is used, and the first one that is not.
-        name_under(&copies[MAX_DIR_IDS - 2], "used");
-        name_under(&copies[MAX_DIR_IDS - 1], "ignored");
-        assert_eq!(listed(&f.fs, "d"), vec!["used"]);
+        // A foreign copy after the cap, with a name under its id.
+        let other: DirId = crate::secret::random_bytes::<16>().unwrap();
+        std::fs::write(real_d.join(".cd-dir (conflict 999)"), other).unwrap();
+        let entry_id: DirId = crate::secret::random_bytes::<16>().unwrap();
+        let real = f.names.encrypt_write(&other, &entry_id, "hidden").unwrap();
+        std::fs::create_dir(real_d.join(&real)).unwrap();
+        std::fs::write(real_d.join(&real).join(DIR_FILE), entry_id).unwrap();
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
+        assert!(listed(&f.fs, "d").is_empty());
         let handle = DirHandle::open_root(&real_d).unwrap();
-        let ids = dirstate::read_dir_ids(&handle, "d", &handle.list().unwrap()).unwrap();
-        assert_eq!(ids.len(), MAX_DIR_IDS);
-        assert_eq!(&ids[1..], &copies[..MAX_DIR_IDS - 1]);
+        let ids = dirstate::read_dir_id(&handle, "d", &handle.list().unwrap()).unwrap();
+        assert_eq!(ids.id.as_slice(), own.as_slice());
+        assert!(!ids.foreign_copy, "the foreign copy is past the cap");
     }
 
-    /// A known gap (README, threat model): a copy of the `.cd-dir` of `a`
-    /// put into `b` lets a file moved from `a` to `b` be read there. It is
-    /// not detected, but a warning is logged, once per directory.
+    /// Closed gap (spec 2026-11-08 one dir id): a copy of the `.cd-dir` of
+    /// `a` put into `b` no longer lets a file moved from `a` to `b` be read
+    /// there. It is hidden, and a warning is logged once per directory.
     #[test]
-    fn move_with_a_planted_dir_id_copy_is_read_and_warned_once() {
+    fn entries_under_foreign_dir_id_copy_are_hidden() {
         let f = fx();
         f.fs.mkdir(&p("a"), 0o755).unwrap();
         f.fs.mkdir(&p("b"), 0o755).unwrap();
@@ -772,19 +759,22 @@ mod tests {
         f.fs.release(h).unwrap();
         let (real_a, real_b) = (f.real("a"), f.real("b"));
         // Listing a normal directory logs nothing.
-        let before = listing::extra_id_warnings();
+        let before = listing::foreign_copy_warnings();
         assert_eq!(listed(&f.fs, "b"), Vec::<String>::new());
-        assert_eq!(listing::extra_id_warnings(), before);
+        assert_eq!(listing::foreign_copy_warnings(), before);
 
         let x = only_entry(&real_a);
         std::fs::rename(&x, real_b.join(x.file_name().unwrap())).unwrap();
         std::fs::copy(real_a.join(DIR_FILE), real_b.join(".cd-dir 2")).unwrap();
+        // A harmless same-id copy next to it changes nothing.
+        std::fs::copy(real_b.join(DIR_FILE), real_b.join(".cd-dir (1)")).unwrap();
         let fs = CryptoFs::new(open_with_master_key(&f.root, &f.mk).unwrap()).unwrap();
-        assert_eq!(listed(&fs, "b"), vec!["x"]);
-        let h = fs.open(&p("b/x"), false, false).unwrap();
-        assert_eq!(fs.read(h, 0, 100).unwrap(), b"secret");
-        fs.release(h).unwrap();
-        assert_eq!(listing::extra_id_warnings(), before + 1);
+        assert_eq!(listed(&fs, "b"), Vec::<String>::new());
+        assert!(matches!(
+            fs.open(&p("b/x"), false, false),
+            Err(Error::NotFound)
+        ));
+        assert_eq!(listing::foreign_copy_warnings(), before + 1);
 
         // An outside change makes a new listing, but no second warning.
         std::fs::write(real_b.join("foreign"), b"").unwrap();
@@ -794,9 +784,9 @@ mod tests {
             .set_modified(later)
             .unwrap();
         let built = listing::listings_built();
-        assert_eq!(listed(&fs, "b"), vec!["x"]);
+        assert_eq!(listed(&fs, "b"), Vec::<String>::new());
         assert!(listing::listings_built() > built);
-        assert_eq!(listing::extra_id_warnings(), before + 1);
+        assert_eq!(listing::foreign_copy_warnings(), before + 1);
     }
 
     #[test]

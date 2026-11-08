@@ -21,7 +21,7 @@ use crate::conflict::{long_candidate, short_candidates};
 use crate::content::CHUNK_SIZE;
 use crate::error::{Error, Result};
 use crate::file::{OpenFile, header_epoch};
-use crate::fs::dirstate::read_dir_ids;
+use crate::fs::dirstate::read_dir_id;
 use crate::fs::listing::{long_layout, open_entry_dir, read_long_name};
 use crate::keyfile::{Argon2Params, KeyFile};
 use crate::keys::{DirId, Epoch, KeySet, MasterKey, SubKeys, VaultId};
@@ -354,11 +354,10 @@ fn encoded_names(dir: &DirHandle, name: &str, kind: Kind) -> Result<Vec<String>>
         .collect())
 }
 
-/// True if one of `encoded` decrypts with `keys` under one of `ids`.
-fn decrypts(keys: &NameKeys, ids: &[DirId], encoded: &[String]) -> bool {
-    encoded
-        .iter()
-        .any(|e| ids.iter().any(|id| keys.decrypt_any(id, e).is_some()))
+/// True if one of `encoded` decrypts with `keys` under the directory id
+/// `id` (never under the id of a `.cd-dir` copy).
+fn decrypts(keys: &NameKeys, id: &DirId, encoded: &[String]) -> bool {
+    encoded.iter().any(|e| keys.decrypt_any(id, e).is_some())
 }
 
 /// True for a real file that holds encrypted content: `.cd-content`, or a
@@ -376,26 +375,26 @@ fn content_epoch(dir: &DirHandle, name: &str) -> Result<Option<Epoch>> {
     }
 }
 
-/// Called by `walk_tree` with the real directory, its ids, an entry name
+/// Called by `walk_tree` with the real directory, its id, an entry name
 /// and its kind; true stops the walk.
-type Visit<'a> = dyn FnMut(&DirHandle, Option<&[DirId]>, &str, Kind) -> Result<bool> + 'a;
+type Visit<'a> = dyn FnMut(&DirHandle, Option<&DirId>, &str, Kind) -> Result<bool> + 'a;
 
 /// Visits every real entry of `dir` and below, depth first, without
-/// following links. `ids` are the directory ids of `dir` (`None` if it
-/// has no `.cd-dir`). Every real directory is entered, also one whose name
+/// following links. `id` is the id in the `.cd-dir` of `dir` (`None` if it
+/// has none; copies are never used). Every real directory is entered, also one whose name
 /// does not decrypt. Stops as soon as `visit` returns true.
-fn walk_tree(dir: &DirHandle, ids: Option<&[DirId]>, visit: &mut Visit<'_>) -> Result<bool> {
+fn walk_tree(dir: &DirHandle, id: Option<&DirId>, visit: &mut Visit<'_>) -> Result<bool> {
     for name in dir.list()? {
         let Some(kind) = kind_of(dir, &name)? else {
             continue;
         };
-        if visit(dir, ids, &name, kind)? {
+        if visit(dir, id, &name, kind)? {
             return Ok(true);
         }
         if kind == Kind::Dir {
             let child = dir.open_dir(&name)?;
-            let found = match read_dir_ids(&child, &name, &child.list()?) {
-                Ok(child_ids) => walk_tree(&child, Some(&child_ids), visit)?,
+            let found = match read_dir_id(&child, &name, &child.list()?) {
+                Ok(ids) => walk_tree(&child, Some(&ids.id), visit)?,
                 Err(Error::NotFound | Error::InvalidFormat { .. }) => {
                     walk_tree(&child, None, visit)?
                 }
@@ -420,11 +419,11 @@ pub fn rotation_unfinished(vault: &UnlockedVault) -> Result<bool> {
     let root = DirHandle::open_root(&vault.root_path)?;
     walk_tree(
         &root,
-        Some(&[vault.marker.vault_id]),
-        &mut |dir, ids, name, kind| {
-            if let Some(ids) = ids {
+        Some(&vault.marker.vault_id),
+        &mut |dir, id, name, kind| {
+            if let Some(id) = id {
                 let encoded = encoded_names(dir, name, kind)?;
-                if !encoded.is_empty() && !decrypts(&names, ids, &encoded) {
+                if !encoded.is_empty() && !decrypts(&names, id, &encoded) {
                     return Ok(true);
                 }
             }
@@ -455,10 +454,10 @@ pub fn verify_next_key(vault: &UnlockedVault, mk: &MasterKey) -> Result<()> {
     let root = DirHandle::open_root(&vault.root_path)?;
     let proven = walk_tree(
         &root,
-        Some(&[vault.marker.vault_id]),
-        &mut |dir, ids, name, kind| {
-            if let Some(ids) = ids
-                && decrypts(&names, ids, &encoded_names(dir, name, kind)?)
+        Some(&vault.marker.vault_id),
+        &mut |dir, id, name, kind| {
+            if let Some(id) = id
+                && decrypts(&names, id, &encoded_names(dir, name, kind)?)
             {
                 return Ok(true);
             }

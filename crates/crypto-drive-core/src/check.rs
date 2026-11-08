@@ -26,7 +26,6 @@ use crate::content::{
 };
 use crate::error::{Error, Result};
 use crate::file::read_file_meta;
-use crate::fs::dirstate::MAX_DIR_IDS;
 use crate::keys::{DirId, EntryId};
 use crate::names::{MAX_ENCODED_NAME_LEN, NameKeys, long_entry_name, validate_name};
 use crate::vault::{
@@ -52,6 +51,9 @@ pub enum FindingKind {
     MissingDirId,
     /// A directory has more than one `.cd-dir` (sync conflict copy).
     MultipleDirIds,
+    /// A `.cd-dir` copy holds another id than `.cd-dir`. A sync client
+    /// never makes one; names under it are not used (tampering).
+    ForeignDirId,
     /// A `.cd-cdl` entry without `.cd-name`, or without `.cd-content` and `.cd-dir`.
     IncompleteLongEntry,
     /// An entry with a sync conflict suffix.
@@ -114,12 +116,7 @@ pub fn check_vault(vault: &UnlockedVault) -> Result<Vec<Finding>> {
     if vault.keys.epochs_desc().len() > 1 {
         checker.report(PathBuf::from(KEY_FILE), FindingKind::RotationInProgress);
     }
-    checker.check_dir(
-        &root,
-        Path::new(""),
-        &[vault.marker.vault_id],
-        DirRole::Root,
-    )?;
+    checker.check_dir(&root, Path::new(""), &vault.marker.vault_id, DirRole::Root)?;
     Ok(checker.findings)
 }
 
@@ -190,13 +187,11 @@ impl Checker<'_> {
         self.report(real_path, FindingKind::Unreadable);
     }
 
-    /// The entry id of the name, if it authenticates under one of the
-    /// directory ids.
-    fn decrypts(&self, dir_ids: &[DirId], encoded: &str) -> Option<EntryId> {
-        dir_ids.iter().find_map(|id| {
-            let (_, entry_id, clear) = self.names.decrypt_any(id, encoded)?;
-            validate_name(&clear).ok().map(|()| entry_id)
-        })
+    /// The entry id of the name, if it authenticates under the directory
+    /// id (never under the id of a `.cd-dir` copy).
+    fn decrypts(&self, dir_id: &DirId, encoded: &str) -> Option<EntryId> {
+        let (_, entry_id, clear) = self.names.decrypt_any(dir_id, encoded)?;
+        validate_name(&clear).ok().map(|()| entry_id)
     }
 
     /// Opens the real directory `name` in `parent` and checks its contents.
@@ -226,21 +221,21 @@ impl Checker<'_> {
         if id != entry_id {
             self.report(rel.to_path_buf(), FindingKind::EntryIdMismatch);
         }
-        self.check_dir(&dir, rel, &[id], DirRole::Dir { long })
+        self.check_dir(&dir, rel, &id, DirRole::Dir { long })
     }
 
-    /// Checks every entry of a real directory. `dir_ids` holds the canonical
-    /// id; conflict copies of `.cd-dir` are added here.
+    /// Checks every entry of a real directory. `dir_id` is the id from its
+    /// `.cd-dir` (the vault id for the root); copies are reported, never
+    /// used.
     fn check_dir(
         &mut self,
         dir: &DirHandle,
         rel: &Path,
-        dir_ids: &[DirId],
+        dir_id: &DirId,
         role: DirRole,
     ) -> Result<()> {
         let mut names = dir.list()?;
         names.sort();
-        let mut ids = dir_ids.to_vec();
         let mut entries = Vec::new();
         for name in names {
             let path = rel.join(&name);
@@ -255,15 +250,14 @@ impl Checker<'_> {
             }
             if matches!(role, DirRole::Dir { .. }) && is_dir_id_copy(&name) {
                 match read_dir_id(dir, &name) {
-                    Ok(Some(id)) => {
-                        // The same cap as the drive (names are sorted, so
-                        // the same copies are used): names under the other
-                        // copies show up as undecryptable, as in the drive.
-                        if !ids.contains(&id) && ids.len() < MAX_DIR_IDS {
-                            ids.push(id);
-                        }
+                    // A sync client only makes copies with the same id. A copy
+                    // with another id is never used (names under it show up
+                    // as undecryptable, as in the drive) and points to
+                    // tampering (spec 2026-11-08 one dir id, 3.3).
+                    Ok(Some(id)) if id == *dir_id => {
                         self.report(path, FindingKind::MultipleDirIds);
                     }
+                    Ok(Some(_)) => self.report(path, FindingKind::ForeignDirId),
                     Ok(None) => self.report(path, FindingKind::ForeignEntry),
                     Err(e) => self.unreadable(path, &e),
                 }
@@ -274,7 +268,7 @@ impl Checker<'_> {
         for (name, path) in entries {
             // An entry (or a subtree) that cannot be read must not stop the
             // check of the others.
-            if let Err(e) = self.check_entry(dir, &name, &path, &ids) {
+            if let Err(e) = self.check_entry(dir, &name, &path, dir_id) {
                 self.unreadable(path, &e);
             }
         }
@@ -286,10 +280,10 @@ impl Checker<'_> {
         dir: &DirHandle,
         name: &str,
         path: &Path,
-        dir_ids: &[DirId],
+        dir_id: &DirId,
     ) -> Result<()> {
         if let Some((entry, suffix)) = long_candidate(name) {
-            return self.check_long_entry(dir, name, entry, !suffix.is_empty(), path, dir_ids);
+            return self.check_long_entry(dir, name, entry, !suffix.is_empty(), path, dir_id);
         }
         if name.starts_with('.') {
             // Unknown control files and foreign dot files.
@@ -300,7 +294,7 @@ impl Checker<'_> {
             short_candidates(name)
                 .into_iter()
                 .find_map(|(prefix, suffix)| {
-                    self.decrypts(dir_ids, prefix)
+                    self.decrypts(dir_id, prefix)
                         .map(|id| (id, !suffix.is_empty()))
                 })
         else {
@@ -333,7 +327,7 @@ impl Checker<'_> {
         entry: &str,
         conflict: bool,
         path: &Path,
-        dir_ids: &[DirId],
+        dir_id: &DirId,
     ) -> Result<()> {
         let incomplete = |c: &mut Self| {
             c.report(path.to_path_buf(), FindingKind::IncompleteLongEntry);
@@ -357,7 +351,7 @@ impl Checker<'_> {
             self.report(path.to_path_buf(), FindingKind::LongNameMismatch);
             return Ok(());
         }
-        let Some(entry_id) = self.decrypts(dir_ids, &full) else {
+        let Some(entry_id) = self.decrypts(dir_id, &full) else {
             self.report(path.to_path_buf(), FindingKind::UndecryptableName);
             return Ok(());
         };
@@ -827,49 +821,77 @@ mod tests {
     }
 
     #[test]
-    fn dir_id_copies_over_the_cap_are_reported_and_not_used() {
-        use crate::fs::dirstate::MAX_DIR_IDS;
+    fn every_foreign_dir_id_copy_is_reported_and_none_is_used() {
+        use crate::fs::dirstate::MAX_DIR_ID_COPIES;
         let f = fx(|fs| {
             fs.mkdir(&p("dir"), 0o755).unwrap();
         });
         let dir = f.root.join(f.real("dir"));
         let mut copies = Vec::new();
-        for i in 0..MAX_DIR_IDS + 4 {
+        for i in 0..MAX_DIR_ID_COPIES + 4 {
             let id: DirId = crate::secret::random_bytes::<16>().unwrap();
             std::fs::write(dir.join(format!(".cd-dir (conflict {i:03})")), id).unwrap();
             copies.push(id);
         }
-        // A file named under the first copy that is not used.
+        // A file named under the first copy.
         let entry_id: DirId = crate::secret::random_bytes::<16>().unwrap();
         let hidden = f
             .names
-            .encrypt_write(&copies[MAX_DIR_IDS - 1], &entry_id, "hidden")
+            .encrypt_write(&copies[0], &entry_id, "hidden")
             .unwrap();
         std::fs::write(dir.join(&hidden), b"x").unwrap();
         let findings = f.check();
         let copies_found = findings
             .iter()
-            .filter(|x| x.kind == FindingKind::MultipleDirIds)
+            .filter(|x| x.kind == FindingKind::ForeignDirId)
             .count();
-        assert_eq!(copies_found, MAX_DIR_IDS + 4);
+        assert_eq!(copies_found, MAX_DIR_ID_COPIES + 4);
         assert!(findings.iter().any(|x| {
             x.kind == FindingKind::UndecryptableName && x.real_path.ends_with(&hidden)
         }));
     }
 
     #[test]
-    fn multiple_dir_ids() {
+    fn same_id_copy_is_a_warning() {
         let f = fx(|fs| {
             fs.mkdir(&p("dir"), 0o755).unwrap();
             write_file(fs, "dir/x", b"x");
         });
         let dir = f.real("dir");
         let copy = PathBuf::from(&dir).join(".cd-dir (1)");
-        std::fs::write(f.root.join(&copy), [9u8; 16]).unwrap();
+        std::fs::copy(f.root.join(&dir).join(DIR_FILE), f.root.join(&copy)).unwrap();
         let findings = f.check();
         assert_eq!(kinds(&findings), vec![FindingKind::MultipleDirIds]);
         assert_eq!(findings[0].real_path, copy);
         assert_eq!(exit_code(&findings), 1);
+    }
+
+    #[test]
+    fn foreign_dir_id_is_an_error() {
+        let f = fx(|fs| {
+            fs.mkdir(&p("dir"), 0o755).unwrap();
+        });
+        let dir = f.real("dir");
+        let copy = PathBuf::from(&dir).join(".cd-dir (1)");
+        std::fs::write(f.root.join(&copy), [9u8; 16]).unwrap();
+        // A file moved here from the directory with id [9; 16].
+        let entry_id: DirId = crate::secret::random_bytes::<16>().unwrap();
+        let moved = f
+            .names
+            .encrypt_write(&[9u8; 16], &entry_id, "moved")
+            .unwrap();
+        std::fs::write(f.root.join(&dir).join(&moved), b"x").unwrap();
+        let findings = f.check();
+        assert!(
+            findings
+                .iter()
+                .any(|x| x.kind == FindingKind::ForeignDirId && x.real_path == copy),
+            "{findings:?}"
+        );
+        assert!(findings.iter().any(|x| {
+            x.kind == FindingKind::UndecryptableName && x.real_path.ends_with(&moved)
+        }));
+        assert_eq!(exit_code(&findings), 2);
     }
 
     #[test]

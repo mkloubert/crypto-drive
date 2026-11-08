@@ -1041,3 +1041,69 @@ fn long_entry_without_name_and_without_data_does_not_block() {
     std::fs::write(entry.join("junk"), b"not ours").unwrap();
     rotate(&f.dir).unwrap();
 }
+
+/// A vault with `a/<name>` ("secret") and `b/`, where the real entry of
+/// `<name>` was moved from outside into the real directory of `b` and a
+/// copy of `a`'s `.cd-dir` was put next to it (spec 2026-11-08 one dir id).
+/// Returns the fixture and the real name of the moved entry.
+fn planted_move(name: &str) -> (tempfile::TempDir, PathBuf, String) {
+    let (tmp, v, _) = test_vault();
+    let dir = v.root_path.clone();
+    let names = NameKeys::new(&v.keys);
+    let vault_id = v.marker.vault_id;
+    let fs = CryptoFs::new(v).unwrap();
+    fs.mkdir(&p("a"), 0o755).unwrap();
+    fs.mkdir(&p("b"), 0o755).unwrap();
+    write_file(&fs, &format!("a/{name}"), b"secret");
+    drop(fs);
+    let real_a = dir.join(real_name_of(&names, &vault_id, &dir, "a"));
+    let real_b = dir.join(real_name_of(&names, &vault_id, &dir, "b"));
+    let moved = std::fs::read_dir(&real_a)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .find(|n| !n.starts_with(CONTROL_PREFIX) || n.starts_with(LONG_PREFIX))
+        .unwrap();
+    std::fs::rename(real_a.join(&moved), real_b.join(&moved)).unwrap();
+    std::fs::copy(real_a.join(".cd-dir"), real_b.join(".cd-dir 2")).unwrap();
+    (tmp, dir, moved)
+}
+
+#[test]
+fn rotation_does_not_adopt_entries_under_foreign_dir_id() {
+    let (_tmp, dir, moved) = planted_move("x.txt");
+    // The moved entry would be lost with the old key: the rotation stops
+    // and names the foreign copy, the old key stays.
+    match rotate(&dir) {
+        Err(e @ Error::RotationNotFinished { .. }) => {
+            assert!(e.to_string().contains(".cd-dir 2"), "{e}");
+        }
+        r => panic!("{:?}", r.err()),
+    }
+    assert_eq!(key_set_epochs(&dir), vec![1, 2]);
+    let (vault, _) = unlock_vault(&dir, None, TEST_PASSWORD).unwrap();
+    let findings = check_vault(&vault).unwrap();
+    let fs = CryptoFs::new(vault).unwrap();
+    assert!(fs.readdir(&p("b")).unwrap().is_empty());
+    assert!(
+        findings.iter().any(|f| f.kind == FindingKind::ForeignDirId),
+        "{findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.kind == FindingKind::UndecryptableName && f.real_path.ends_with(&moved)),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn rotation_stops_on_long_entry_under_foreign_dir_id() {
+    let (_tmp, dir, moved) = planted_move(LONG_FILE);
+    assert!(moved.starts_with(LONG_PREFIX), "{moved}");
+    match rotate(&dir) {
+        Err(e @ Error::RotationNotFinished { .. }) => {
+            assert!(e.to_string().contains(&moved), "{e}");
+        }
+        r => panic!("{:?}", r.err()),
+    }
+}

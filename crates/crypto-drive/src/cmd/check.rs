@@ -39,6 +39,7 @@ fn kind_text(kind: &FindingKind) -> String {
     match kind {
         FindingKind::MissingDirId => "missing-dir-id".into(),
         FindingKind::MultipleDirIds => "multiple-dir-ids".into(),
+        FindingKind::ForeignDirId => "foreign-dir-id".into(),
         FindingKind::IncompleteLongEntry => "incomplete-long-entry".into(),
         FindingKind::ConflictCopy => "conflict-copy".into(),
         FindingKind::ForeignEntry => "foreign-entry".into(),
@@ -123,6 +124,11 @@ mod tests {
             "rotation-in-progress"
         );
         assert_eq!(kind_text(&FindingKind::InvalidPadding), "invalid-padding");
+    }
+
+    #[test]
+    fn foreign_dir_id_text() {
+        assert_eq!(kind_text(&FindingKind::ForeignDirId), "foreign-dir-id");
     }
 
     #[test]
