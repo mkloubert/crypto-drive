@@ -511,6 +511,9 @@ of the big file, default 300) and `SMOKE_MOUNT_OPTS` (extra FUSE options).
 The real-mount tests (`cargo test -p crypto-drive-fuse --test mount --
 --include-ignored`) read `CRYPTO_DRIVE_TEST_MOUNT_OPTS` the same way.
 
+All tests, the real-mount tests and the smoke test pass on macOS 26 with
+macFUSE 5.5 (kernel extension) and on Debian 13 (Linux 6.12, ARM64, fuse3).
+
 ## Fuzzing
 
 The fuzz targets live in `fuzz/`, a separate crate on a pinned nightly

@@ -1,11 +1,12 @@
 # CLAUDE.md – crypto-drive
 
 Guide for Claude Code sessions in this repository. Read it fully at the start
-of every session. Last full project scan: 2026-11-01 (branch `main`,
-commit `34a0dee`, plus the open-file limit work). Last change: 2026-11-08
+of every session. Last full project scan: 2026-11-08 (branch `main`,
+commit `2ef9857`, full review in `REPORT.md`). Last change: 2026-11-08
 (review findings S1 mode bits, S2 chmod without links, S3 key hygiene,
 R1 + R2 never drop buffered data, P1 kept listings, P4-a + P5-b fewer
-syncs).
+syncs; new review SEC-/ROB-/PERF- ids; coarse-mtime fix after the first
+Debian 13 test run).
 
 ## 0. Rules for Claude (always)
 
@@ -146,7 +147,7 @@ without a mount.
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
 | `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. Every flush runs `check_space` first (`space_needed`: growth + every rewritten chunk, an upper bound for copy-on-write file systems); `write` flushes **before** it takes data that would overflow the buffer, so a failed write changes nothing. Test hooks: `fail_chunk_writes_after`, `fake_free_space`. |
-| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd; a state that leaves it hands its `SharedDir` with the listing to `KeptDirs`, an fd-free LRU bounded by listing entries `KEPT_DIR_ENTRIES` 131 072, about 25 MiB; review P1): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`, `unsynced.rs` (which real directories need a sync; review P4-a / P5-b). |
+| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd; a state that leaves it hands its `SharedDir` with the listing to `KeptDirs`, an fd-free LRU bounded by listing entries `KEPT_DIR_ENTRIES` 131 072, about 25 MiB; review P1): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index; racy mtimes: a mtime younger than `RACY_WINDOW` 2 s is checked once more after the window), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`, `unsynced.rs` (which real directories need a sync; review P4-a / P5-b). |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
 | `rotate` | Offline, resumable master key rotation. |
@@ -390,7 +391,7 @@ State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
 10 ignored. After S2: 520 passed, 0 failed, 10 ignored. After S3: 524 passed,
-0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored. After P4-a + P5-b: 548 passed, 0 failed, 10 ignored.
+0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored. After P4-a + P5-b: 548 passed, 0 failed, 10 ignored. After the coarse-mtime fix: 553 passed, 0 failed, 10 ignored.
 
 ## 8. Platform notes
 
@@ -401,7 +402,20 @@ tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
   Finder writes `.DS_Store` into the drive (stored encrypted) and reads its
   own xattr copy markers back.
 - **Linux**: needs `fuse3` (`fusermount3`), no libfuse at build time.
-  Real-mount tests and the smoke test have **never run on Linux** yet.
+  Verified by the owner on 2026-11-08 on Debian 13 (kernel 6.12, ARM64,
+  fuse3): `cargo test --workspace`, the real-mount tests
+  (`cargo test -p crypto-drive-fuse --test mount -- --include-ignored`) and
+  `scripts/smoke-test.sh` pass with the coarse-mtime fix.
+  First `cargo test --workspace` on a real Linux host (owner, 2026-11-08,
+  Debian 13, kernel 6.12 ARM64, as root): 9 core failures, 8 from coarse
+  directory mtimes (kernels before 6.13 have no multigrain timestamps: 4 ms
+  ticks on Debian's kernel, measured with `touch`) and 1 because root
+  ignores mode 0o444. Fixed (spec `2026-11-08-coarse-mtime-design.md`).
+  Tests that check root-dependent permission errors skip as root
+  (`rustix::process::geteuid().is_root()`). The container kernel (7.0) has
+  fine timestamps, so coarse-mtime bugs do not show up here: simulate them
+  by truncating `mtime` in `backing::convert_stat` (temporarily) or with
+  `set_modified` in a test.
 - **Daemon mode**: logs go to `/dev/null` after detach.
 
 ## 9. Known limits (by design, documented)
@@ -497,6 +511,10 @@ and "Limits", `docs/format.md` section 8 notes.
   in-memory xattrs, LRU chunk cache, fsyncdir.
 - Verified by the owner on macOS 26.6.2 + macFUSE 5.5.0: all tests, real
   mount tests, smoke test, Finder copies.
+- Verified by the owner on Debian 13 (kernel 6.12, ARM64, fuse3) on
+  2026-11-08: all tests, real mount tests, smoke test (first Linux run).
+  README "Tests and tools" and the GitHub page ("Quality" section) name
+  both tested systems; keep them current when a new system is verified.
 - Review 2026-11-01, Linux container tested only, not yet committed:
   open-file limit fixed (CLI raises `RLIMIT_NOFILE`, core sizes the
   directory cache from it); `set_times` on an open file flushes its buffer
@@ -508,8 +526,17 @@ and "Limits", `docs/format.md` section 8 notes.
   GitHub page. Time-based flush of dirty chunks done (core + mount thread, container
   only). Caps for hostile input done (`MAX_DIR_IDS`, key file slots and size;
   reader limits in `docs/format.md` 3.1 and 10).
-- Review 2026-11-02 in untracked `REPORT.md` (S*, R*, P* findings, next steps
-  in its section 5). S1 done 2026-11-08 (commit `3fcf2df`), Linux container
+- Review 2026-11-08 (second full review, commit `2ef9857`) in untracked
+  `REPORT.md`: ids `SEC-*`, `ROB-*`, `PERF-*`, five next steps per area in
+  its sections 3–5, owner questions in section 6. Top items: ROB-1 (plain
+  name winner by sort order + rename-over removes another device's entry,
+  silent data loss), ROB-2 (Linux: `rename_lock` read side held while
+  blocking on a file mutex freezes the drive), SEC-1 (`rotate-key` takes
+  Argon2 params of the first slot), SEC-2 (`-o allow_other` does not work:
+  fuser ACL stays `Owner`; docs overstate the risk), PERF-1 (= P2),
+  PERF-2 (TTL, negative entries), PERF-3 (incremental listing rebuild).
+  Container only, no mount. The old 2026-11-02 report is no longer on disk.
+- Review 2026-11-02 (S*, R*, P* findings). S1 done 2026-11-08 (commit `3fcf2df`), Linux container
   only, mount tests on the Mac pending: mode bits clamped to 0o777, `nosuid,nodev` always, warning on
   `-o allow_other` (owner may still choose to refuse it instead), README
   threat model, `docs/format.md` 8 note, GitHub page. S2 done 2026-11-08
@@ -541,7 +568,19 @@ and "Limits", `docs/format.md` section 8 notes.
   rebuild a lost `.cd-dir` from the entry id in the parent name (needs an
   owner decision). Then: the longer-term items
   (need owner decisions).
-- Open: Linux real-mount run; per-flush file key (format change, would fix
+- Coarse mtimes done 2026-11-08, not yet committed; tested in the container
+  (also with a simulated 100 ms tick) and by the owner on Debian 13: all
+  tests, real-mount tests and smoke test green (first full Linux run, so it
+  also covers S1–S3, R1 + R2, P1, P4-a + P5-b on Linux; their mount tests on
+  the Mac are still pending)
+  (spec `docs/superpowers/specs/2026-11-08-coarse-mtime-design.md`, plan
+  `docs/superpowers/plans/2026-11-08-coarse-mtime.md`): `Index.racy` in
+  `fs/dirstate.rs`, `RACY_WINDOW` 2 s: a directory mtime read less than 2 s
+  after it was set is racy (sticky); after the window `is_current` fails
+  and `shared_dir` bumps the version, so the listing is built once more.
+  `CryptoFs::now()`, test hook `advance_clock`. README limit changed
+  (seen about 2 s after the last change in that directory).
+- Open: per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;
   encrypted persistent xattrs; `check --repair`; Windows backend.

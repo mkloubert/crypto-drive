@@ -2,8 +2,10 @@
 
 - **Date:** 2026-11-08
 - **Status:** Approved by the owner (chat, 2026-11-08: approach 1 only,
-  window 2 s). Implemented 2026-11-08, Linux container only (also with a
-  simulated 100 ms mtime tick); Debian 13 run by the owner pending
+  window 2 s). Implemented 2026-11-08; tested in the Linux container (also
+  with a simulated 100 ms mtime tick) and by the owner on Debian 13 (kernel
+  6.12, ARM64): `cargo test --workspace`, the real-mount tests and
+  `scripts/smoke-test.sh` pass
 - **Author:** Marcel Joachim Kloubert
 - **Source:** first `cargo test --workspace` on Debian 13 (Linux
   6.12.115+deb13.1-arm64), 9 failed core tests
@@ -129,7 +131,7 @@ the same check.
   look at the outside change. They then pass with coarse and fine mtimes.
 - `read_only_mode_file_can_be_opened_for_reading`: checks the
   `NotPermitted` result only if the test does not run as root (`geteuid`).
-- To check on Debian 13 by the owner (coarse mtimes): `cargo test --workspace`.
+- Checked on Debian 13 by the owner (coarse mtimes): `cargo test --workspace` passes.
 
 ## 6. Docs
 

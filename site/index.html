@@ -460,7 +460,7 @@
             <p class="label">05 — Quality</p>
             <h2 class="mt-4 font-display text-5xl tracking-wide sm:text-6xl">Tested like it matters</h2>
           </div>
-          <p class="text-ash">The core has no FUSE dependency, so the whole file system logic runs in plain unit tests. A second, independent Python implementation produces the test vectors.</p>
+          <p class="text-ash">The core has no FUSE dependency, so the whole file system logic runs in plain unit tests. A second, independent Python implementation produces the test vectors. All tests, the real-mount tests and the smoke test pass on macOS 26 (macFUSE 5.5) and on Debian 13 (ARM64, fuse3).</p>
         </div>
         <dl class="reveal mt-12 grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-white/[0.07] bg-white/[0.07] lg:grid-cols-4">
           <div class="bg-ink p-6"><dt class="label">Golden vaults</dt><dd class="mt-3 text-sm text-ash">Two frozen v1 vaults every future version must read.</dd></div>
