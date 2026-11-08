@@ -105,6 +105,12 @@ crypto-drive unmount ~/drive
   working: the buffers are written and a warning tells you to close those
   programs and stop again, or to run `crypto-drive unmount --force <mountpoint>`.
   (In daemon mode the warning is not shown.)
+- If buffered changes cannot be written (for example the disk of the vault
+  is full), a stop signal keeps the drive mounted and logs an error; free
+  space and stop again. If the drive is unmounted from outside
+  (`crypto-drive unmount`, Finder, `umount`), the process does not end: it
+  tries again every 5 seconds, keeps the vault locked and ends when the
+  changes are written. Only `kill -9` drops them.
 - If a drive process was killed without an unmount, the mount point is left
   dead ("Transport endpoint is not connected" on Linux, "Device not
   configured" on macOS). `mount` then points to
@@ -469,6 +475,18 @@ Not protected against:
   uploaded in full. A grow that needs more than the free space of the vault
   disk fails at once with "no space left on device", and the file keeps its
   old size. If a grow fails partway, the file is set back to its old size.
+- A full disk. Changes are buffered in memory (up to 4 MiB per open file)
+  and written after 5 seconds without writes, at close or at `fsync`.
+  Before each write to the vault, the drive checks the free space (also for
+  an overwrite, which needs free blocks on APFS and btrfs) and fails with
+  "no space left on device" before it changes anything. A write that would
+  need more buffer then fails too, and its data is not taken. If the last
+  close of a file cannot write its changes, they stay in memory, an error
+  is logged, and they are written as soon as there is space again; a new
+  open of the file sees them. Programs that ignore the error of `close()`
+  (shell redirects, many scripts) do not learn about the delay. The check
+  is an upper bound: on file systems that overwrite in place (ext4) it can
+  refuse a write that would just fit.
 - `check` only reports. There is no repair yet.
 - No GUI, no keychain, no sharing with more users, no Windows backend.
 

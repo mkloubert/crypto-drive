@@ -25,7 +25,8 @@
 use crate::backing::DirHandle;
 use crate::content::{
     CHUNK_OVERHEAD, CHUNK_SIZE, ChunkCipher, FileHeader, HEADER_LEN, PADDED_HEADER_LEN,
-    chunk_count, chunk_offset, ciphertext_size, header_len, open_size, plaintext_size, seal_size,
+    SIZE_BLOCK_LEN, chunk_count, chunk_offset, ciphertext_size, header_len, open_size,
+    plaintext_size, seal_size,
 };
 use crate::error::{Error, Result};
 use crate::keys::{EntryId, Epoch, derive_size_key};
@@ -149,6 +150,39 @@ fn write_padding(file: &File, from: u64, to: u64) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     static FAIL_AFTER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static FAKE_FREE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test hook: the free space (bytes) that `check_space` sees in this
+/// thread. `None` uses the real file system.
+#[cfg(test)]
+pub(crate) fn fake_free_space(bytes: Option<u64>) {
+    FAKE_FREE.with(|c| c.set(bytes));
+}
+
+/// Free bytes for this user on the file system of `file`, or `None` if
+/// the file system reports no sizes.
+fn free_space(file: &File) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(bytes) = FAKE_FREE.with(std::cell::Cell::get) {
+        return Some(bytes);
+    }
+    let st = match rustix::fs::fstatvfs(file) {
+        Ok(st) => st,
+        Err(e) => {
+            log::debug!("could not read the free space: {e}");
+            return None;
+        }
+    };
+    if st.f_blocks == 0 {
+        return None;
+    }
+    let unit = if st.f_frsize > 0 {
+        st.f_frsize
+    } else {
+        st.f_bsize
+    };
+    Some(st.f_bavail.saturating_mul(unit))
 }
 
 /// Test hook: after `n` more chunk writes in this thread, the next chunk
@@ -442,6 +476,17 @@ impl OpenFile {
             .checked_add(u64::try_from(data.len()).map_err(|_| Error::InvalidArgument)?)
             .ok_or(Error::InvalidArgument)?;
         check_len(end, self.padded())?;
+        // Make room first: if the buffer cannot be written, the write fails
+        // before it takes anything (review R2). Before, the data was taken
+        // and then the flush failed, so the caller got an error for data
+        // that was kept, and a caller that ignores errors grew the buffer
+        // without a limit.
+        let new_chunks = (offset / CHUNK_SIZE..=(end - 1) / CHUNK_SIZE)
+            .filter(|i| !self.dirty.contains(i))
+            .count();
+        if !self.dirty.is_empty() && self.dirty.len() + new_chunks > Self::MAX_DIRTY_CHUNKS {
+            self.flush()?;
+        }
         let mut pos = offset;
         let mut src = 0usize;
         while pos < end {
@@ -467,9 +512,6 @@ impl OpenFile {
         }
         self.plain_len = self.plain_len.max(end);
         self.changes = self.changes.wrapping_add(1);
-        if self.dirty.len() > Self::MAX_DIRTY_CHUNKS {
-            self.flush()?;
-        }
         Ok(data.len())
     }
 
@@ -507,7 +549,7 @@ impl OpenFile {
     }
 
     /// True if changes in memory are not on disk yet.
-    fn has_unwritten_changes(&self) -> bool {
+    pub(crate) fn has_unwritten_changes(&self) -> bool {
         !self.dirty.is_empty() || self.plain_len != self.disk_len
     }
 
@@ -566,21 +608,23 @@ impl OpenFile {
     /// In a padded vault a size change then writes a new size block and
     /// sets the real length to the new stage; new padding bytes are random.
     ///
-    /// A grow first checks that the free space of the real file system is
-    /// enough (`ENOSPC` if not). If a grow fails partway, the real file is
-    /// set back to its old size, so it stays readable; the changes stay in
-    /// memory and a later flush tries again.
+    /// Every flush first checks that the free space of the real file system
+    /// is enough (`ENOSPC` if not), also for an overwrite: copy-on-write
+    /// file systems (APFS, btrfs) need free blocks to overwrite, and a
+    /// short write would leave a chunk that does not decrypt (review R2).
+    /// If a grow fails partway, the real file is set back to its old size,
+    /// so it stays readable. On any error the changes stay in memory and a
+    /// later flush tries again.
     pub fn flush(&mut self) -> Result<()> {
         if !self.has_unwritten_changes() {
             return Ok(());
         }
         self.check_writable()?;
-        if self.plain_len <= self.disk_len {
-            return self.write_out();
-        }
         self.check_space()?;
+        let growing = self.plain_len > self.disk_len;
         let result = self.write_out();
-        if result.is_err()
+        if growing
+            && result.is_err()
             && let Err(e) = self.undo_grow()
         {
             log::warn!("could not undo a failed grow of a file: {e}");
@@ -588,34 +632,55 @@ impl OpenFile {
         result
     }
 
-    /// Fails with `ENOSPC` if growing the real file to the size in memory
-    /// needs more than the free space. A file system that reports no sizes
-    /// is not checked.
+    /// An upper bound of the bytes the next flush writes to new blocks on a
+    /// copy-on-write file system: the growth of the real file plus every
+    /// chunk it rewrites (dirty chunks, the old and new last chunk of a
+    /// size change and, in a padded vault, the zero chunks of a grow, which
+    /// overwrite fresh padding) plus the size block and new padding.
+    fn space_needed(&self) -> Result<u64> {
+        let padded = self.padded();
+        let target = ciphertext_size(self.plain_len, padded);
+        let growth = target.saturating_sub(self.file.metadata()?.len());
+        let mut chunks = self.dirty.len() as u64;
+        let mut extra = 0;
+        if self.plain_len != self.disk_len {
+            let old_last = last_index(self.disk_len);
+            let new_last = last_index(self.plain_len);
+            chunks += u64::from(!self.dirty.contains(&new_last));
+            if old_last < new_last {
+                chunks += u64::from(!self.dirty.contains(&old_last));
+                if padded {
+                    let gap = new_last - old_last - 1;
+                    let dirty_in_gap = self.dirty.range(old_last + 1..new_last).count() as u64;
+                    chunks = chunks.saturating_add(gap - dirty_in_gap);
+                }
+            }
+            if padded {
+                extra = SIZE_BLOCK_LEN;
+                if self.plain_len < self.disk_len {
+                    extra += target - used_len(self.plain_len, true);
+                }
+            }
+        }
+        Ok(growth
+            .saturating_add(chunks.saturating_mul(CHUNK_SIZE + CHUNK_OVERHEAD))
+            .saturating_add(extra))
+    }
+
+    /// Fails with `ENOSPC` if the next flush may need more than the free
+    /// space (see `space_needed`). A file system that reports no sizes is
+    /// not checked.
     fn check_space(&self) -> Result<()> {
-        let need = ciphertext_size(self.plain_len, self.padded())
-            .saturating_sub(self.file.metadata()?.len());
+        let need = self.space_needed()?;
         if need == 0 {
             return Ok(());
         }
-        let st = match rustix::fs::fstatvfs(&self.file) {
-            Ok(st) => st,
-            Err(e) => {
-                log::debug!("could not read the free space: {e}");
-                return Ok(());
+        match free_space(&self.file) {
+            Some(free) if need > free => {
+                Err(Error::Io(std::io::Error::from(rustix::io::Errno::NOSPC)))
             }
-        };
-        if st.f_blocks == 0 {
-            return Ok(());
+            _ => Ok(()),
         }
-        let unit = if st.f_frsize > 0 {
-            st.f_frsize
-        } else {
-            st.f_bsize
-        };
-        if need > st.f_bavail.saturating_mul(unit) {
-            return Err(Error::Io(std::io::Error::from(rustix::io::Errno::NOSPC)));
-        }
-        Ok(())
     }
 
     /// Sets the real file back to the size on disk after a failed grow: the
@@ -1426,6 +1491,85 @@ mod tests {
             want.extend_from_slice(b"tail");
             assert_eq!(read_all(&mut reopen(&t)), want);
         });
+    }
+
+    /// A file with `MAX_DIRTY_CHUNKS` full dirty chunks (nothing flushed).
+    fn file_with_a_full_buffer(t: &Tmp) -> OpenFile {
+        let mut f = new_file(t);
+        for i in 0..OpenFile::MAX_DIRTY_CHUNKS as u64 {
+            f.write(i * CHUNK_SIZE, &vec![1u8; CS]).unwrap();
+        }
+        assert_eq!(f.dirty.len(), OpenFile::MAX_DIRTY_CHUNKS);
+        f
+    }
+
+    #[test]
+    fn write_that_needs_a_failing_flush_changes_nothing() {
+        // Review R2: the data of a write that returns an error must not be
+        // taken, else the program thinks it failed while it is buffered.
+        both(|padded| {
+            let t = tmp(padded);
+            let mut f = file_with_a_full_buffer(&t);
+            let full = OpenFile::MAX_DIRTY_CHUNKS as u64 * CHUNK_SIZE;
+            for _ in 0..5 {
+                fail_chunk_writes_after(Some(0));
+                let r = f.write(full, b"more").map(|_| ());
+                fail_chunk_writes_after(None);
+                assert!(is_enospc(&r), "{r:?}");
+                assert_eq!(f.len(), full);
+                assert!(f.read(full, 10).unwrap().is_empty());
+                // The buffer does not grow while flushes fail.
+                assert!(f.dirty.len() <= OpenFile::MAX_DIRTY_CHUNKS);
+            }
+            f.write(full, b"more").unwrap();
+            f.flush().unwrap();
+            drop(f);
+            let mut g = reopen(&t);
+            assert_eq!(g.len(), full + 4);
+            assert_eq!(g.read(full, 10).unwrap(), b"more");
+        });
+    }
+
+    #[test]
+    fn overwrite_on_a_full_disk_fails_before_any_chunk_write() {
+        // Review R2: on copy-on-write file systems an overwrite needs free
+        // blocks too; a short write would leave a broken chunk.
+        both(|padded| {
+            let t = tmp(padded);
+            let data = pattern(3 * CS);
+            let mut f = new_file(&t);
+            f.write(0, &data).unwrap();
+            f.flush().unwrap();
+            f.write(10, b"new").unwrap();
+            fake_free_space(Some(1000));
+            let r = f.flush();
+            fake_free_space(None);
+            assert!(is_enospc(&r), "{r:?}");
+            assert_eq!(read_all(&mut reopen(&t)), data, "the vault was touched");
+            f.flush().unwrap();
+            let mut want = data.clone();
+            want[10..13].copy_from_slice(b"new");
+            assert_eq!(read_all(&mut reopen(&t)), want);
+        });
+    }
+
+    #[test]
+    fn free_space_need_counts_dirty_chunks_and_growth() {
+        let t = tmp(false);
+        let mut f = new_file(&t);
+        f.write(0, &pattern(2 * CS)).unwrap();
+        f.flush().unwrap();
+        f.write(5, b"x").unwrap();
+        assert_eq!(f.space_needed().unwrap(), CHUNK_SIZE + CHUNK_OVERHEAD);
+        f.write(2 * CHUNK_SIZE, b"y").unwrap();
+        // Chunks 0 and 2 are dirty, and the grow rewrites the old last
+        // chunk 1 (it loses its "last" flag); plus the growth itself.
+        let grow =
+            ciphertext_size(2 * CHUNK_SIZE + 1, false) - ciphertext_size(2 * CHUNK_SIZE, false);
+        assert_eq!(
+            f.space_needed().unwrap(),
+            3 * (CHUNK_SIZE + CHUNK_OVERHEAD) + grow
+        );
     }
 
     #[test]

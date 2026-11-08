@@ -447,7 +447,7 @@
 
         <div class="reveal mt-10 rounded-2xl border border-ember/25 bg-ember/[0.06] p-6 text-sm leading-relaxed text-ash">
           <p><span class="font-mono text-xs uppercase tracking-[0.18em] text-ember-soft">Status</span></p>
-          <p class="mt-2"><strong class="font-medium text-paper">crypto-drive is pre-release software.</strong> The on-disk format is frozen (version 1, with golden test vaults and known-answer tests), but there has been no external security audit yet. Keep backups of important data. A power cut during a write can make a 64 KiB part of a file unreadable, so databases and VM images are better kept outside the drive. On macOS the drive serves one request at a time and reports itself as case-insensitive (it is case sensitive). Not supported yet: symlinks, hard links, persistent extended attributes, a GUI and Windows.</p>
+          <p class="mt-2"><strong class="font-medium text-paper">crypto-drive is pre-release software.</strong> The on-disk format is frozen (version 1, with golden test vaults and known-answer tests), but there has been no external security audit yet. Keep backups of important data. A power cut during a write can make a 64 KiB part of a file unreadable, so databases and VM images are better kept outside the drive. On a full disk, changes wait in memory until there is space again, and the drive is not unmounted before they are written. On macOS the drive serves one request at a time and reports itself as case-insensitive (it is case sensitive). Not supported yet: symlinks, hard links, persistent extended attributes, a GUI and Windows.</p>
         </div>
       </div>
     </section>

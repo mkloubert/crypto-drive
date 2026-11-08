@@ -3,7 +3,8 @@
 Guide for Claude Code sessions in this repository. Read it fully at the start
 of every session. Last full project scan: 2026-11-01 (branch `main`,
 commit `34a0dee`, plus the open-file limit work). Last change: 2026-11-08
-(review findings S1 mode bits, S2 chmod without links, S3 key hygiene).
+(review findings S1 mode bits, S2 chmod without links, S3 key hygiene,
+R1 + R2 never drop buffered data).
 
 ## 0. Rules for Claude (always)
 
@@ -143,7 +144,7 @@ without a mount.
 | `keys` | Key hierarchy: `MasterKey`, `KeySet` (1 or 2 epochs), HKDF sub keys, per-file keys, `DirId`. |
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
-| `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. |
+| `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. Every flush runs `check_space` first (`space_needed`: growth + every rewritten chunk, an upper bound for copy-on-write file systems); `write` flushes **before** it takes data that would overflow the buffer, so a failed write changes nothing. Test hooks: `fail_chunk_writes_after`, `fake_free_space`. |
 | `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
@@ -155,17 +156,20 @@ without a mount.
 
 Key runtime structures in `CryptoFs`: an LRU cache clear path → `DirState`
 (dropped when the real directory mtime changes), shared dir states, one
-shared `Arc<Mutex<OpenFile>>` per real file for all handles, handle table.
+shared `Arc<Mutex<OpenFile>>` per real file for all handles, handle table,
+`orphans` (open files without a handle whose flush failed with an I/O
+error; kept until `flush_idle` / `flush_all` writes them, `unwritten_files`
+counts them; non-I/O errors are not kept, a retry would never work).
 
 ### 3.2 `crypto-drive-fuse`
 
 | Module | Role |
 |---|---|
-| `adapter` | `FuseFs`: `fuser::Filesystem` on top of `CryptoFs`. `do_*` methods hold the logic. A `rename_lock: RwLock<()>`: rename takes the write side; open and setattr take the read side from lookup to the end. `PERM_MASK` 0o777: mode bits are reported and set without setuid / setgid / sticky (they come from unauthenticated vault data, review S1). Open flags: Linux `FOPEN_KEEP_CACHE` for unchanged files, macOS `FOPEN_PURGE_UBC | FOPEN_PURGE_ATTR`. TTL 1 s. |
+| `adapter` | `FuseFs`: `fuser::Filesystem` on top of `CryptoFs`. `do_*` methods hold the logic. A `rename_lock: RwLock<()>`: rename takes the write side; open and setattr take the read side from lookup to the end. `PERM_MASK` 0o777: mode bits are reported and set without setuid / setgid / sticky (they come from unauthenticated vault data, review S1). Open flags: Linux `FOPEN_KEEP_CACHE` for unchanged files, macOS `FOPEN_PURGE_UBC | FOPEN_PURGE_ATTR`. TTL 1 s. `core_err` logs through `log_level`: damaged vault data `warn`, I/O errors of the ops in `WRITE_OPS` `error`, the rest `debug`. |
 | `inodes` | `InodeTable`: inode ↔ clear path, lookup counts, `forget`, rename of subtrees by range (sorted map). |
 | `xattrs` | In-memory xattrs per clear path (never on disk). 1 MiB per entry, 64 MiB total; values over the limit are accepted but dropped. Linux keeps only `user.*`. |
 | `errno` | `to_errno`: core error → errno (spec section 8 table). |
-| `mount` | `MountRequest`, `mount_and_wait` (starts `start_idle_flusher`: every `IDLE_FLUSH_TICK` 1 s it calls `CryptoFs::flush_idle` with `IDLE_FLUSH_AFTER` 5 s / `MAX_DIRTY_AGE` 30 s; busy files are skipped via `try_lock`), `mount_options`, `unmount_command`, `StopReason`. A stop signal tries a normal unmount (`Running::try_unmount`: macOS `unmount(2)`, Linux `fusermount3 -u` without `-z`); if busy, `wait_for_stop` writes the buffers, logs a warning and keeps the drive mounted until the next signal or an outside unmount. |
+| `mount` | `MountRequest`, `mount_and_wait` (starts `start_idle_flusher`: every `IDLE_FLUSH_TICK` 1 s it calls `CryptoFs::flush_idle` with `IDLE_FLUSH_AFTER` 5 s / `MAX_DIRTY_AGE` 30 s; busy files are skipped via `try_lock`), `mount_options`, `unmount_command`, `StopReason`. A stop signal tries a normal unmount (`Running::try_unmount`: macOS `unmount(2)`, Linux `fusermount3 -u` without `-z`); `wait_for_stop` first writes all buffers: if that fails (`StopProblem::Unwritten`) the drive stays mounted with an error; then if busy (`StopProblem::Busy`) a warning and the drive stays mounted, until the next signal or an outside unmount. After the session `wait_for_written` retries `flush_all` every `UNWRITTEN_RETRY` 5 s until it works (owner decision: unmount waits; `kill -9` drops). |
 | `macos_mount` | macOS only: mounts through libfuse 2 `fuse_mount()` (fuser's own `fuse_mount_compat25` fails with macFUSE 5.5). `build.rs` adds `/usr/local/lib` or `FUSE_LIB_DIR` to the link path. |
 
 fuser features: macOS `macos-no-mount` + `macfuse-4-compat`; Linux default
@@ -380,7 +384,7 @@ State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
 10 ignored. After S2: 520 passed, 0 failed, 10 ignored. After S3: 524 passed,
-0 failed, 10 ignored.
+0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored.
 
 ## 8. Platform notes
 
@@ -505,9 +509,16 @@ and "Limits", `docs/format.md` section 8 notes.
   threat model, `docs/format.md` 8 note, GitHub page. S2 done 2026-11-08
   (commit `c78f863`), Linux container only (macOS variant only cross-checked):
   `set_mode` never follows links, README limit "needs /proc". S3 done
-  2026-11-08, not yet committed, Linux container only: `sha2`/`hmac` with
+  2026-11-08 (commit `047aa37`), Linux container only: `sha2`/`hmac` with
   `zeroize`, `NameCipher` in a `LockedBox`, `ChunkCipher` swap gap in README
-  threat model and on the GitHub page. Next: S4 + S5 (daemon child). Then: the longer-term items
+  threat model and on the GitHub page. R1 + R2 done 2026-11-08, not yet
+  committed, Linux container only (spec
+  `docs/superpowers/specs/2026-11-08-never-drop-dirty-data-design.md`, plan
+  `docs/superpowers/plans/2026-11-08-never-drop-dirty-data.md`): orphans,
+  free-space check before every flush, write without partial take, write
+  errors logged at `error` (`log_level`, `WRITE_OPS` in the adapter), stop
+  and unmount wait for unwritten data; README, GitHub page. Next: S4 + S5
+  (daemon child), R3 (replaced real file under an open handle). Then: the longer-term items
   (need owner decisions).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode

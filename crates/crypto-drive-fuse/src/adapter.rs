@@ -208,11 +208,24 @@ fn time(t: TimeOrNow) -> SystemTime {
 /// Logs a core error and maps it to errno. Auth and format errors carry the
 /// real (encrypted) name and are logged as warnings; clear names never
 /// appear in the core errors.
-fn core_err(op: &str, e: Error) -> i32 {
-    match &e {
-        Error::AuthFailed { .. } | Error::InvalidFormat { .. } => log::warn!("{op}: {e}"),
-        _ => log::debug!("{op}: {e}"),
+/// Operations whose I/O errors may mean lost or late data (they write
+/// buffered changes); such an error is always logged (review R1).
+const WRITE_OPS: [&str; 6] = ["write", "flush", "fsync", "release", "truncate", "utimens"];
+
+/// The log level of a core error of `op`. Damaged vault data is a warning,
+/// an I/O error while writing data an error; the rest (not found, exists,
+/// ...) is normal and only logged with `--debug`. No message here carries
+/// a clear name.
+fn log_level(op: &str, e: &Error) -> log::Level {
+    match e {
+        Error::AuthFailed { .. } | Error::InvalidFormat { .. } => log::Level::Warn,
+        Error::Io(_) if WRITE_OPS.contains(&op) => log::Level::Error,
+        _ => log::Level::Debug,
     }
+}
+
+fn core_err(op: &str, e: Error) -> i32 {
+    log::log!(log_level(op, &e), "{op}: {e}");
     to_errno(&e)
 }
 
@@ -1133,6 +1146,20 @@ mod tests {
         assert_eq!(d.perm, 0o755);
         assert_eq!(to_file_attr(1, &attr(FileKind::File, 512, 0)).blocks, 1);
         assert_eq!(to_file_attr(1, &attr(FileKind::File, 513, 0)).blocks, 2);
+    }
+
+    #[test]
+    fn write_errors_are_logged_without_debug() {
+        // Review R1: a failed write of buffered data must be visible.
+        let io = || Error::Io(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        for op in ["write", "flush", "fsync", "release", "truncate", "utimens"] {
+            assert_eq!(log_level(op, &io()), log::Level::Error, "{op}");
+        }
+        assert_eq!(log_level("read", &io()), log::Level::Debug);
+        assert_eq!(log_level("lookup", &Error::NotFound), log::Level::Debug);
+        assert_eq!(log_level("flush", &Error::NotFound), log::Level::Debug);
+        let auth = Error::AuthFailed { what: "x".into() };
+        assert_eq!(log_level("read", &auth), log::Level::Warn);
     }
 
     #[test]

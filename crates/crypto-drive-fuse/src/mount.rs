@@ -226,23 +226,38 @@ pub fn mount_and_wait(
 
     let reason = wait_for_stop(
         &stop_rx,
+        || fs.flush_all().map_err(|e| e.to_string()),
         || running.try_unmount(&req.mountpoint),
-        |e| {
-            // Keep the data safe in case the process is killed while busy.
-            if let Err(e) = fs.flush_all() {
-                log::warn!("could not write all buffers: {e}");
+        |problem| match problem {
+            StopProblem::Unwritten(e) => {
+                log::error!("{}", unwritten_message(fs.unwritten_files(), e))
             }
-            log::warn!("{}", busy_message(&req.mountpoint, e));
+            StopProblem::Busy(e) => log::warn!("{}", busy_message(&req.mountpoint, e)),
         },
     );
     drop(idle_flusher);
     running.join()?;
-    if reason == StopReason::Signal
-        && let Err(e) = fs.flush_all()
-    {
-        log::warn!("could not write all buffers after unmount: {e}");
-    }
+    // After an outside unmount (which the process cannot refuse) or a
+    // forced one, buffered changes may still be in memory: keep trying.
+    wait_for_written(
+        &stop_rx,
+        || fs.flush_all().map_err(|e| e.to_string()),
+        UNWRITTEN_RETRY,
+        |e| log::error!("{}", still_unwritten_message(fs.unwritten_files(), e)),
+    );
     Ok(reason)
+}
+
+/// How often the process tries again to write buffered changes after the
+/// drive is gone (see `wait_for_written`).
+const UNWRITTEN_RETRY: Duration = Duration::from_secs(5);
+
+/// Why a stop signal did not unmount.
+enum StopProblem<'a> {
+    /// Buffered changes could not be written (for example a full disk).
+    Unwritten(&'a str),
+    /// The unmount failed: programs still use the drive.
+    Busy(&'a io::Error),
 }
 
 /// Starts a thread that writes the buffered changes of open files once
@@ -265,26 +280,83 @@ fn start_idle_flusher(
     stop_tx
 }
 
-/// Waits for the end of the mount. A stop signal tries `try_unmount`; if
-/// that fails (the drive is busy), `on_busy` is told and the drive stays
-/// mounted until the next signal or an outside unmount. Before, the
-/// process ended anyway and left a dead mount ("Device not configured" on
-/// macOS, "Transport endpoint is not connected" on Linux). A closed
-/// channel counts as an outside unmount.
+/// Waits for the end of the mount. A stop signal first writes all
+/// buffers (`write_all`); if that fails, `on_problem` gets `Unwritten` and
+/// the drive stays mounted, so the changes are not lost (review R1). Then
+/// it tries `try_unmount`; if that fails (the drive is busy), `on_problem`
+/// gets `Busy` and the drive stays mounted too. Before, the process ended
+/// anyway and left a dead mount ("Device not configured" on macOS,
+/// "Transport endpoint is not connected" on Linux). In both cases the next
+/// signal or an outside unmount ends the wait. A closed channel counts as
+/// an outside unmount.
 fn wait_for_stop(
     stop_rx: &Receiver<StopReason>,
+    mut write_all: impl FnMut() -> Result<(), String>,
     mut try_unmount: impl FnMut() -> io::Result<()>,
-    mut on_busy: impl FnMut(&io::Error),
+    mut on_problem: impl FnMut(StopProblem<'_>),
 ) -> StopReason {
     loop {
         match stop_rx.recv().unwrap_or(StopReason::Unmounted) {
             StopReason::Unmounted => return StopReason::Unmounted,
-            StopReason::Signal => match try_unmount() {
-                Ok(()) => return StopReason::Signal,
-                Err(e) => on_busy(&e),
-            },
+            StopReason::Signal => {
+                if let Err(e) = write_all() {
+                    on_problem(StopProblem::Unwritten(&e));
+                    continue;
+                }
+                match try_unmount() {
+                    Ok(()) => return StopReason::Signal,
+                    Err(e) => on_problem(StopProblem::Busy(&e)),
+                }
+            }
         }
     }
+}
+
+/// After the drive is gone: calls `write_all` until it works, every
+/// `retry`. `on_waiting` is told on the first failure and again on each
+/// stop signal, so the user sees why the process does not end. The data
+/// lives only in memory now, so giving up would lose it; `kill -9` is the
+/// way out.
+fn wait_for_written(
+    stop_rx: &Receiver<StopReason>,
+    mut write_all: impl FnMut() -> Result<(), String>,
+    retry: Duration,
+    mut on_waiting: impl FnMut(&str),
+) {
+    let mut report = true;
+    loop {
+        match write_all() {
+            Ok(()) => return,
+            Err(e) if report => {
+                on_waiting(&e);
+                report = false;
+            }
+            Err(_) => {}
+        }
+        match stop_rx.recv_timeout(retry) {
+            Ok(StopReason::Signal) => report = true,
+            Ok(StopReason::Unmounted) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(retry),
+        }
+    }
+}
+
+/// The error for a stop signal while buffered changes cannot be written.
+fn unwritten_message(files: usize, e: &str) -> String {
+    format!(
+        "could not write the changes of {files} file(s) ({e}); the drive stays mounted so \
+         they are not lost; free space on the disk of the vault and stop again"
+    )
+}
+
+/// The error while the process waits after the drive is gone.
+fn still_unwritten_message(files: usize, e: &str) -> String {
+    format!(
+        "the drive is unmounted, but the changes of {files} file(s) are not written yet \
+         ({e}); crypto-drive tries again every {secs} s and ends when they are written; \
+         free space on the disk of the vault (`kill -9` drops them)",
+        secs = UNWRITTEN_RETRY.as_secs()
+    )
 }
 
 /// The note for a stop signal that could not unmount a busy drive.
@@ -403,29 +475,146 @@ mod tests {
         io::Error::from(io::ErrorKind::ResourceBusy)
     }
 
-    /// Runs `wait_for_stop` on `events` with unmount results taken from
-    /// `unmounts` in order; returns the reason, the number of unmount
-    /// tries and the number of busy reports.
-    fn stop_with(
+    /// What one `wait_for_stop` run did.
+    #[derive(Debug, PartialEq, Eq)]
+    struct StopRun {
+        reason: StopReason,
+        flushes: usize,
+        unmount_tries: usize,
+        unwritten_reports: usize,
+        busy_reports: usize,
+    }
+
+    /// Runs `wait_for_stop` on `events`, with flush results taken from
+    /// `flushes` (then `Ok`) and unmount results from `unmounts` in order.
+    fn stop_run(
         events: &[StopReason],
+        flushes: Vec<Result<(), String>>,
         unmounts: Vec<io::Result<()>>,
-    ) -> (StopReason, usize, usize) {
+    ) -> StopRun {
         let (tx, rx) = channel();
         for e in events {
             tx.send(*e).unwrap();
         }
         drop(tx);
+        let mut flush_results = flushes.into_iter();
         let mut results = unmounts.into_iter();
-        let (mut tries, mut busy_reports) = (0, 0);
+        let (mut flushes, mut tries, mut unwritten, mut busy) = (0, 0, 0, 0);
         let reason = wait_for_stop(
             &rx,
+            || {
+                flushes += 1;
+                flush_results.next().unwrap_or(Ok(()))
+            },
             || {
                 tries += 1;
                 results.next().expect("unexpected unmount try")
             },
-            |_| busy_reports += 1,
+            |problem| match problem {
+                StopProblem::Unwritten(_) => unwritten += 1,
+                StopProblem::Busy(_) => busy += 1,
+            },
         );
-        (reason, tries, busy_reports)
+        StopRun {
+            reason,
+            flushes,
+            unmount_tries: tries,
+            unwritten_reports: unwritten,
+            busy_reports: busy,
+        }
+    }
+
+    /// `stop_run` with flushes that always work: reason, unmount tries,
+    /// busy reports.
+    fn stop_with(
+        events: &[StopReason],
+        unmounts: Vec<io::Result<()>>,
+    ) -> (StopReason, usize, usize) {
+        let run = stop_run(events, vec![], unmounts);
+        assert_eq!(run.unwritten_reports, 0);
+        (run.reason, run.unmount_tries, run.busy_reports)
+    }
+
+    #[test]
+    fn signal_with_unwritten_data_keeps_the_drive_mounted() {
+        // Review R1: buffered data that cannot be written (full disk) must
+        // not be dropped by the unmount; the next signal tries again.
+        let events = [StopReason::Signal, StopReason::Signal];
+        let run = stop_run(&events, vec![Err("disk full".into())], vec![Ok(())]);
+        assert_eq!(
+            run,
+            StopRun {
+                reason: StopReason::Signal,
+                flushes: 2,
+                unmount_tries: 1,
+                unwritten_reports: 1,
+                busy_reports: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn unwritten_data_and_an_outside_unmount_end_the_wait_for_stop() {
+        let events = [StopReason::Signal, StopReason::Unmounted];
+        let run = stop_run(&events, vec![Err("disk full".into())], vec![]);
+        assert_eq!(run.reason, StopReason::Unmounted);
+        assert_eq!((run.flushes, run.unmount_tries), (1, 0));
+    }
+
+    /// Runs `wait_for_written` with flush results from `flushes`; the
+    /// events are sent before. Returns the flush tries and the reports.
+    fn written_run(events: &[StopReason], flushes: Vec<Result<(), String>>) -> (usize, usize) {
+        let (tx, rx) = channel();
+        for e in events {
+            tx.send(*e).unwrap();
+        }
+        let mut results = flushes.into_iter();
+        let (mut tries, mut reports) = (0, 0);
+        wait_for_written(
+            &rx,
+            || {
+                tries += 1;
+                results.next().expect("unexpected flush")
+            },
+            Duration::from_millis(1),
+            |_| reports += 1,
+        );
+        drop(tx);
+        (tries, reports)
+    }
+
+    #[test]
+    fn wait_for_written_retries_until_the_data_is_written() {
+        let fails = || Err::<(), _>("disk full".to_string());
+        assert_eq!(written_run(&[], vec![Ok(())]), (1, 0));
+        // One report for the first failure, not one per retry.
+        assert_eq!(
+            written_run(&[], vec![fails(), fails(), fails(), Ok(())]),
+            (4, 1)
+        );
+        // A stop signal while waiting reports again (and does not give up).
+        assert_eq!(
+            written_run(&[StopReason::Signal], vec![fails(), fails(), Ok(())]),
+            (3, 2)
+        );
+    }
+
+    #[test]
+    fn unwritten_messages_say_what_happens() {
+        let m = unwritten_message(2, "No space left on device");
+        assert_eq!(
+            m,
+            "could not write the changes of 2 file(s) (No space left on device); the drive \
+             stays mounted so they are not lost; free space on the disk of the vault and \
+             stop again"
+        );
+        let m = still_unwritten_message(2, "No space left on device");
+        assert_eq!(
+            m,
+            "the drive is unmounted, but the changes of 2 file(s) are not written yet (No \
+             space left on device); crypto-drive tries again every 5 s and ends when they \
+             are written; free space on the disk of the vault (`kill -9` drops them)"
+        );
     }
 
     #[test]

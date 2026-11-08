@@ -161,6 +161,10 @@ pub struct CryptoFs {
     next_generation: AtomicU64,
     /// The shared state of each open real file.
     open_files: Mutex<HashMap<RealFileId, Weak<Mutex<OpenFile>>>>,
+    /// Open files without a handle whose buffered changes could not be
+    /// written (an I/O error such as a full disk). They are kept until a
+    /// flush works, so closing never drops data (review R1).
+    orphans: Mutex<Vec<Arc<Mutex<OpenFile>>>>,
     handles: Mutex<HashMap<FileHandleId, files::Handle>>,
     /// The next file handle id; ids are never reused.
     next_handle: AtomicU64,
@@ -187,6 +191,7 @@ impl CryptoFs {
             shared_dirs: Mutex::new(HashMap::new()),
             next_generation: AtomicU64::new(0),
             open_files: Mutex::new(HashMap::new()),
+            orphans: Mutex::new(Vec::new()),
             handles: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
         })

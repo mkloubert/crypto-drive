@@ -269,6 +269,58 @@ impl CryptoFs {
         Ok((Arc::clone(&h.file), h.write, h.append))
     }
 
+    /// Keeps `file` as an orphan after its flush failed with `e`, so its
+    /// buffered changes survive the last close. Only I/O errors (a full
+    /// disk, EIO) are kept: they may go away, so the idle flush and
+    /// `flush_all` try again. Other errors (for example a chunk that does
+    /// not decrypt) never go away; the stop would then wait forever.
+    fn keep_unwritten(&self, file: &Shared, e: &Error) {
+        if !matches!(e, Error::Io(_)) {
+            return;
+        }
+        let mut orphans = self.orphans.lock().expect("orphans lock poisoned");
+        if !orphans.iter().any(|o| Arc::ptr_eq(o, file)) {
+            log::error!(
+                "could not write the changes of a closed file ({e}); they stay in memory and \
+                 are written as soon as possible"
+            );
+            orphans.push(Arc::clone(file));
+        }
+    }
+
+    /// Forgets orphans that have nothing left to write. A file that a
+    /// request holds right now is looked at next time.
+    fn settle_orphans(&self) {
+        self.orphans
+            .lock()
+            .expect("orphans lock poisoned")
+            .retain(|file| match file.try_lock() {
+                Ok(open) => open.has_unwritten_changes(),
+                Err(TryLockError::WouldBlock) => true,
+                Err(TryLockError::Poisoned(_)) => panic!("open file lock poisoned"),
+            });
+        self.prune_open_files();
+    }
+
+    /// How many open files (orphans included) have changes that are not
+    /// written yet.
+    pub fn unwritten_files(&self) -> usize {
+        self.open_files_now()
+            .iter()
+            .filter(|file| lock(file).has_unwritten_changes())
+            .count()
+    }
+
+    /// The shared states of all open files.
+    fn open_files_now(&self) -> Vec<Shared> {
+        self.open_files
+            .lock()
+            .expect("open files lock poisoned")
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+
     /// Forgets real files that are no longer open.
     fn prune_open_files(&self) {
         self.open_files
@@ -393,7 +445,9 @@ impl CryptoFs {
     }
 
     /// Flushes and drops the handle. The handle is gone even if the flush
-    /// fails; the flush error is returned.
+    /// fails; the flush error is returned. After an I/O error the buffered
+    /// changes are kept (see `keep_unwritten`); the kernel ignores the
+    /// result of a release, so they would be lost without a word.
     pub fn release(&self, fh: FileHandleId) -> Result<()> {
         let handle = self
             .handles
@@ -402,6 +456,9 @@ impl CryptoFs {
             .remove(&fh)
             .ok_or(Error::InvalidArgument)?;
         let result = lock(&handle.file).flush();
+        if let Err(e) = &result {
+            self.keep_unwritten(&handle.file, e);
+        }
         drop(handle);
         self.prune_open_files();
         result
@@ -412,6 +469,9 @@ impl CryptoFs {
         let loc = self.locate_path(path)?;
         let shared = self.open_shared(&loc, true)?;
         let result = lock(&shared).truncate(len);
+        if let Err(e) = &result {
+            self.keep_unwritten(&shared, e);
+        }
         drop(shared);
         self.prune_open_files();
         result
@@ -451,21 +511,14 @@ impl CryptoFs {
         lock(&file).truncate(len)
     }
 
-    /// Flushes every open file; returns the first error after trying all.
     /// Flushes the open files whose unwritten changes rested for `idle` or
-    /// are older than `max_age` (see `OpenFile::flush_if_idle`). Call it at
-    /// regular times; returns how many files it flushed. A file that a
-    /// request holds right now is skipped and looked at in the next call,
-    /// so this never waits behind a long operation. Errors are logged; the
-    /// file is tried again after `max_age`.
+    /// are older than `max_age` (see `OpenFile::flush_if_idle`), orphans
+    /// included. Call it at regular times; returns how many files it
+    /// flushed. A file that a request holds right now is skipped and looked
+    /// at in the next call, so this never waits behind a long operation.
+    /// Errors are logged; the file is tried again after `max_age`.
     pub fn flush_idle(&self, now: Instant, idle: Duration, max_age: Duration) -> usize {
-        let open: Vec<Shared> = self
-            .open_files
-            .lock()
-            .expect("open files lock poisoned")
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect();
+        let open = self.open_files_now();
         let mut flushed = 0;
         for file in open {
             let mut open = match file.try_lock() {
@@ -476,20 +529,17 @@ impl CryptoFs {
             match open.flush_if_idle(now, idle, max_age) {
                 Ok(true) => flushed += 1,
                 Ok(false) => {}
-                Err(e) => log::warn!("could not write the buffered changes of an open file: {e}"),
+                Err(e) => log::error!("could not write the buffered changes of a file: {e}"),
             }
         }
+        self.settle_orphans();
         flushed
     }
 
+    /// Flushes every open file (orphans included); returns the first error
+    /// after trying all.
     pub fn flush_all(&self) -> Result<()> {
-        let open: Vec<Shared> = self
-            .open_files
-            .lock()
-            .expect("open files lock poisoned")
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect();
+        let open = self.open_files_now();
         let mut first_error = None;
         for file in open {
             if let Err(e) = lock(&file).flush()
@@ -498,6 +548,7 @@ impl CryptoFs {
                 first_error = Some(e);
             }
         }
+        self.settle_orphans();
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -965,6 +1016,82 @@ mod tests {
         f.fs.write(h, 4, b"x").unwrap();
         f.fs.release(h).unwrap();
         assert_eq!(read_file(&f.fs, "f"), b"0123x");
+    }
+
+    fn is_enospc<T: std::fmt::Debug>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::Io(e)) if e.raw_os_error() == Some(libc_enospc()))
+    }
+
+    fn libc_enospc() -> i32 {
+        rustix::io::Errno::NOSPC.raw_os_error()
+    }
+
+    fn fresh_read(f: &Fx, path: &str) -> Vec<u8> {
+        let fs =
+            CryptoFs::new(crate::vault::open_with_master_key(&f.root, &f.mk).unwrap()).unwrap();
+        read_file(&fs, path)
+    }
+
+    #[test]
+    fn failed_release_keeps_the_data_until_it_can_be_written() {
+        // Review R1: the last close used to drop the buffer on a write error.
+        let f = fx();
+        let (_, h) = f.fs.create(&p("a"), 0o644).unwrap();
+        f.fs.write(h, 0, b"hello").unwrap();
+        crate::file::fake_free_space(Some(0));
+        assert!(is_enospc(&f.fs.release(h)));
+        assert_eq!(f.fs.unwritten_files(), 1);
+        // A new open sees the buffered data, and its close keeps it too.
+        let h = f.fs.open(&p("a"), false, false).unwrap();
+        assert_eq!(f.fs.read(h, 0, 100).unwrap(), b"hello");
+        assert!(is_enospc(&f.fs.release(h)));
+        assert_eq!(f.fs.orphans.lock().unwrap().len(), 1, "kept once");
+        assert!(is_enospc(&f.fs.flush_all()));
+        assert!(fresh_read(&f, "a").is_empty(), "not on disk yet");
+        // Space is back: the next flush writes it and forgets the orphan.
+        crate::file::fake_free_space(None);
+        f.fs.flush_all().unwrap();
+        assert_eq!(f.fs.unwritten_files(), 0);
+        assert!(f.fs.orphans.lock().unwrap().is_empty());
+        assert!(
+            f.fs.open_files
+                .lock()
+                .unwrap()
+                .values()
+                .all(|w| w.strong_count() == 0)
+        );
+        assert_eq!(fresh_read(&f, "a"), b"hello");
+    }
+
+    #[test]
+    fn idle_flush_writes_an_orphan() {
+        let f = fx();
+        let (_, h) = f.fs.create(&p("a"), 0o644).unwrap();
+        f.fs.write(h, 0, b"later").unwrap();
+        crate::file::fake_free_space(Some(0));
+        assert!(f.fs.release(h).is_err());
+        crate::file::fake_free_space(None);
+        let start = Instant::now();
+        f.fs.flush_idle(start, IDLE_FLUSH_AFTER, MAX_DIRTY_AGE);
+        assert_eq!(
+            f.fs.flush_idle(start + IDLE_FLUSH_AFTER, IDLE_FLUSH_AFTER, MAX_DIRTY_AGE),
+            1
+        );
+        assert_eq!(f.fs.unwritten_files(), 0);
+        assert!(f.fs.orphans.lock().unwrap().is_empty());
+        assert_eq!(fresh_read(&f, "a"), b"later");
+    }
+
+    #[test]
+    fn failed_truncate_by_path_keeps_the_data() {
+        let f = fx();
+        write_file(&f.fs, "a", &vec![7u8; 200_000], 0o644);
+        crate::file::fake_free_space(Some(0));
+        assert!(is_enospc(&f.fs.truncate(&p("a"), 10)));
+        assert_eq!(f.fs.unwritten_files(), 1);
+        crate::file::fake_free_space(None);
+        f.fs.flush_all().unwrap();
+        assert_eq!(fresh_read(&f, "a"), vec![7u8; 10]);
     }
 
     #[test]
