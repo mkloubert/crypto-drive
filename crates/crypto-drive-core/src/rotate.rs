@@ -21,7 +21,7 @@
 //! a crash leaves at most a duplicate (both entries readable) or a leftover
 //! temporary file. The next run cleans these up and goes on.
 
-use crate::backing::{DirHandle, stat_file};
+use crate::backing::{DirHandle, set_file_mode, stat_file};
 use crate::conflict::{long_candidate, rotation_conflict_name, short_candidates};
 use crate::content::CHUNK_SIZE;
 use crate::error::{Error, Result};
@@ -754,7 +754,8 @@ impl Rotation<'_> {
             }
             new.flush()?;
             let file = new.into_file();
-            dir.set_mode(ROT_TMP_FILE, st.mode & MODE_MASK)?;
+            // Through the open file, not the name: nothing can be swapped in.
+            set_file_mode(&file, st.mode & MODE_MASK)?;
             dir.set_times(ROT_TMP_FILE, Some(st.atime), Some(st.mtime))?;
             file.sync_all()?;
             Ok(())

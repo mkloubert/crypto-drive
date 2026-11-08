@@ -58,6 +58,17 @@ pub struct Stat {
 thread_local! {
     /// Device and inode of each directory this thread synced.
     static SYNCED_DIRS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Runs once in `set_mode` between the type check and the chmod, so a
+    /// test can swap the entry in exactly that window.
+    static BEFORE_CHMOD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs the test hook of `set_mode`, if one is set.
+fn before_chmod() {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_CHMOD.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
 }
 
 /// Takes the list of directories this thread synced since the last call.
@@ -159,6 +170,12 @@ fn convert_stat(st: &rustix::fs::Stat) -> Stat {
 
 fn mode_bits(mode: u32) -> Mode {
     Mode::from_bits_truncate(mode as RawMode)
+}
+
+/// Sets the mode of an open file through its descriptor (no name, so
+/// nothing can be swapped in between).
+pub fn set_file_mode(file: &File, mode: u32) -> Result<()> {
+    rustix::fs::fchmod(file, mode_bits(mode)).map_err(map_errno)
 }
 
 /// Metadata of an open file.
@@ -379,13 +396,58 @@ impl DirHandle {
         rustix::fs::fchmod(&self.fd, mode_bits(mode)).map_err(map_errno)
     }
 
+    /// Sets the mode of the file or directory `name`, never through a link.
+    /// Links and other kinds give `NotPermitted`.
+    ///
+    /// Linux: `fchmodat` has no `AT_SYMLINK_NOFOLLOW` (only `fchmodat2`,
+    /// kernel 6.6+). So the entry is held with `O_PATH | O_NOFOLLOW`, its
+    /// type is checked with `fstat`, and the chmod goes through
+    /// `/proc/self/fd/N` to exactly that inode. An entry swapped for a link
+    /// after the open cannot redirect it. Needs `/proc` (fails closed
+    /// without it).
+    #[cfg(target_os = "linux")]
     pub fn set_mode(&self, name: &str, mode: u32) -> Result<()> {
-        // chmodat cannot refuse links on Linux, so check the type first. A
-        // small window remains between the check and the chmod (TOCTOU).
+        check_name(name)?;
+        let fd = rustix::fs::openat(
+            &self.fd,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(map_errno)?;
+        let st = rustix::fs::fstat(&fd).map_err(map_errno)?;
+        if convert_stat(&st).kind == Kind::Other {
+            return Err(Error::NotPermitted);
+        }
+        before_chmod();
+        let proc_path = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd));
+        rustix::fs::chmod(proc_path.as_str(), mode_bits(mode)).map_err(|e| {
+            if e == Errno::NOENT {
+                // The fd is open, so only a missing /proc gives this.
+                Error::Io(std::io::Error::other(
+                    "cannot change the mode: /proc is not mounted",
+                ))
+            } else {
+                map_errno(e)
+            }
+        })
+    }
+
+    /// Sets the mode of the file or directory `name`, never through a link.
+    /// Links and other kinds give `NotPermitted`.
+    ///
+    /// macOS: `AT_SYMLINK_NOFOLLOW` works with `fchmodat`. If the entry is
+    /// swapped for a link after the type check, the chmod changes only the
+    /// link itself, never its target.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_mode(&self, name: &str, mode: u32) -> Result<()> {
+        check_name(name)?;
         if self.stat(name)?.kind == Kind::Other {
             return Err(Error::NotPermitted);
         }
-        rustix::fs::chmodat(&self.fd, name, mode_bits(mode), AtFlags::empty()).map_err(map_errno)
+        before_chmod();
+        rustix::fs::chmodat(&self.fd, name, mode_bits(mode), AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(map_errno)
     }
 
     /// Syncs this directory, so its entry changes are on the device.
@@ -502,6 +564,71 @@ mod tests {
         d.create_file("f", 0o600).unwrap();
         d.set_mode("f", 0o640).unwrap();
         assert_eq!(d.stat("f").unwrap().mode & 0o7777, 0o640);
+    }
+
+    /// A file outside the vault with mode 0o600, and its path.
+    fn outside_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("secret");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        (t, path)
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::symlink_metadata(path).unwrap().permissions(),
+        ) & 0o7777
+    }
+
+    #[test]
+    fn set_mode_refuses_a_symlink() {
+        let (t, d) = root();
+        let (_o, secret) = outside_file();
+        std::os::unix::fs::symlink(&secret, t.path().join("l")).unwrap();
+        assert!(matches!(d.set_mode("l", 0o644), Err(Error::NotPermitted)));
+        assert_eq!(mode_of(&secret), 0o600);
+    }
+
+    #[test]
+    fn set_mode_never_follows_a_link_swapped_in_after_the_check() {
+        let (t, d) = root();
+        let (_o, secret) = outside_file();
+        d.create_file("f", 0o600).unwrap();
+        let dir = t.path().to_path_buf();
+        let target = secret.clone();
+        BEFORE_CHMOD.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(dir.join("f"), dir.join("f.old")).unwrap();
+                std::os::unix::fs::symlink(&target, dir.join("f")).unwrap();
+            }))
+        });
+        // The result may be Ok (the old inode or the link itself changed)
+        // or an error; the file outside must never change.
+        let _ = d.set_mode("f", 0o644);
+        assert_eq!(mode_of(&secret), 0o600);
+    }
+
+    #[test]
+    fn set_file_mode_changes_the_open_file() {
+        let (_t, d) = root();
+        let file = d.create_file("f", 0o600).unwrap();
+        set_file_mode(&file, 0o640).unwrap();
+        assert_eq!(d.stat("f").unwrap().mode & 0o7777, 0o640);
+    }
+
+    #[test]
+    fn set_mode_checks_the_name() {
+        let (_t, d) = root();
+        assert!(matches!(
+            d.set_mode("..", 0o700),
+            Err(Error::InvalidArgument)
+        ));
+        assert!(matches!(
+            d.set_mode("a/b", 0o700),
+            Err(Error::InvalidArgument)
+        ));
     }
 
     #[test]

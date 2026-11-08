@@ -3,7 +3,7 @@
 Guide for Claude Code sessions in this repository. Read it fully at the start
 of every session. Last full project scan: 2026-11-01 (branch `main`,
 commit `34a0dee`, plus the open-file limit work). Last change: 2026-11-08
-(review finding S1, mode bits).
+(review findings S1 mode bits, S2 chmod without links).
 
 ## 0. Rules for Claude (always)
 
@@ -137,7 +137,7 @@ without a mount.
 
 | Module | Role |
 |---|---|
-| `backing` | The only place with syscalls on the real (encrypted) directory. Directory handles (`openat`, `renameat`, `unlinkat`, `mkdirat`) via `rustix`, so `PATH_MAX` does not apply. The part to port for Windows. |
+| `backing` | The only place with syscalls on the real (encrypted) directory. Directory handles (`openat`, `renameat`, `unlinkat`, `mkdirat`) via `rustix`, so `PATH_MAX` does not apply. Never follows links: `set_mode` on Linux holds the entry with `O_PATH|O_NOFOLLOW`, checks it with `fstat` and chmods through `/proc/self/fd/N` (needs `/proc`); macOS `AT_SYMLINK_NOFOLLOW`; `set_file_mode` = `fchmod` on an open file (rotation). Test hook `BEFORE_CHMOD`. The part to port for Windows. |
 | `vault` | `.cd-vault` marker, `init_vault`, `unlock_vault`, `open_with_master_key`, mount lock. |
 | `keyfile` | `.cd-key` format, password slots, Argon2 limits (`Argon2Params::MIN` for tests). Reader limits: `MAX_SLOTS` 16, `MAX_KEY_FILE_LEN` 64 KiB, regular file only (`load` opens with `O_NONBLOCK`, so a FIFO cannot block). |
 | `keys` | Key hierarchy: `MasterKey`, `KeySet` (1 or 2 epochs), HKDF sub keys, per-file keys, `DirId`. |
@@ -376,7 +376,7 @@ block).
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
-10 ignored.
+10 ignored. After S2: 520 passed, 0 failed, 10 ignored.
 
 ## 8. Platform notes
 
@@ -495,11 +495,13 @@ and "Limits", `docs/format.md` section 8 notes.
   only). Caps for hostile input done (`MAX_DIR_IDS`, key file slots and size;
   reader limits in `docs/format.md` 3.1 and 10).
 - Review 2026-11-02 in untracked `REPORT.md` (S*, R*, P* findings, next steps
-  in its section 5). S1 done 2026-11-08, not yet committed, Linux container
-  only: mode bits clamped to 0o777, `nosuid,nodev` always, warning on
+  in its section 5). S1 done 2026-11-08 (commit `3fcf2df`), Linux container
+  only, mount tests on the Mac pending: mode bits clamped to 0o777, `nosuid,nodev` always, warning on
   `-o allow_other` (owner may still choose to refuse it instead), README
-  threat model, `docs/format.md` 8 note, GitHub page. Next: S2 (`set_mode`
-  follows links), S3 + S4 + S5 (key hygiene). Then: the longer-term items
+  threat model, `docs/format.md` 8 note, GitHub page. S2 done 2026-11-08,
+  not yet committed, Linux container only (macOS variant only cross-checked):
+  `set_mode` never follows links, README limit "needs /proc". Next: S3 + S4
+  + S5 (key hygiene). Then: the longer-term items
   (need owner decisions).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode

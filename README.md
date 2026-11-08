@@ -364,6 +364,9 @@ Not protected against:
 ## Limits
 
 - No symlinks, no hard links, no special files and no `chown`.
+- `chmod` never follows a link in the vault. On Linux it goes through
+  `/proc/self/fd`, so `/proc` must be mounted (it fails with an error
+  otherwise).
 - Extended attributes (xattrs) are kept in memory only, while the drive is
   mounted. They are never written to disk, so they are gone after an
   unmount. Setting one never fails, so Finder, `cp`, `ditto` and `rsync`
