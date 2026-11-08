@@ -24,6 +24,8 @@ use crate::error::{Error, Result};
 use crate::keys::{DirId, EntryId, Epoch};
 use crate::names::{BackingName, to_backing_name, validate_name};
 use crate::vault::DIR_FILE;
+use lru::LruCache;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime};
@@ -42,8 +44,19 @@ const MAX_FREE_ROUNDS: usize = 64;
 /// from outside between taking and locking it.
 const MAX_LOCK_ROUNDS: usize = 8;
 /// The map of shared directory data is pruned of unused entries above
-/// this size.
-const SHARED_DIRS_PRUNE: usize = 4096;
+/// this size (or twice the size after the last prune, whichever is more:
+/// kept directories stay in use, so a fixed limit would prune on every
+/// new directory).
+pub(super) const SHARED_DIRS_PRUNE: usize = 4096;
+
+/// Most listing entries (summed over the directories) that `KeptDirs`
+/// holds outside the fd cache. One entry of a listing takes about 200
+/// bytes (clear name, real name, entry id, map node), so this is about
+/// 25 MiB at most.
+pub(super) const KEPT_DIR_ENTRIES: usize = 131_072;
+
+/// Finds the shared data of a real directory: device, inode, canonical id.
+pub(crate) type SharedKey = (u64, u64, DirId);
 
 /// One entry of a directory, as found in the real directory (an entry of the
 /// name index, HS 3.3).
@@ -75,6 +88,98 @@ pub(crate) struct SharedDir {
     warned_extra_ids: AtomicBool,
 }
 
+impl SharedDir {
+    /// New shared data of a real directory with the mtime `mtime` and no
+    /// listing yet.
+    pub(crate) fn new(mtime: SystemTime) -> SharedDir {
+        SharedDir {
+            change: Mutex::new(()),
+            index: Mutex::new(Index {
+                mtime,
+                version: 0,
+                listing: None,
+            }),
+            warned_extra_ids: AtomicBool::new(false),
+        }
+    }
+}
+
+/// The map of shared directory data by `SharedKey`, with its prune mark.
+pub(crate) struct SharedDirs {
+    map: HashMap<SharedKey, Weak<SharedDir>>,
+    /// Unused entries are pruned when the map reaches this size.
+    prune_at: usize,
+}
+
+impl SharedDirs {
+    pub(crate) fn new() -> SharedDirs {
+        SharedDirs {
+            map: HashMap::new(),
+            prune_at: SHARED_DIRS_PRUNE,
+        }
+    }
+}
+
+/// Shared directory data kept after its state left the fd cache (review
+/// P1). A state holds an open fd, so the fd cache is small (a part of the
+/// open-file limit, at most 1024); before, its listing went with it, and
+/// a tree with more directories (node_modules, a git checkout, an IDE
+/// index run) built every listing again on every pass. The data here holds
+/// no fd. The next state of the same real directory finds it through
+/// `shared_dirs` and keeps the listing if the mtime did not change (the
+/// same check as for a cached state). Bounded by listing entries.
+pub(crate) struct KeptDirs {
+    lru: LruCache<SharedKey, (Arc<SharedDir>, usize)>,
+    /// Sum of the weights in `lru`.
+    weight: usize,
+    budget: usize,
+}
+
+impl KeptDirs {
+    pub(crate) fn new(budget: usize) -> KeptDirs {
+        KeptDirs {
+            lru: LruCache::unbounded(),
+            weight: 0,
+            budget,
+        }
+    }
+
+    /// Keeps `dir` with the weight `weight` (1 plus its listing entries)
+    /// as the most recent one; drops the least recent ones beyond the
+    /// budget. One heavier than the whole budget is not kept.
+    pub(crate) fn keep(&mut self, key: SharedKey, dir: Arc<SharedDir>, weight: usize) {
+        if let Some((_, old)) = self.lru.pop(&key) {
+            self.weight -= old;
+        }
+        if weight > self.budget {
+            return;
+        }
+        self.lru.put(key, (dir, weight));
+        self.weight += weight;
+        while self.weight > self.budget {
+            let Some((_, (_, w))) = self.lru.pop_lru() else {
+                break;
+            };
+            self.weight -= w;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lru.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn weight(&self) -> usize {
+        self.weight
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, key: &SharedKey) -> bool {
+        self.lru.contains(key)
+    }
+}
+
 /// The name index of a real directory (HS 3.3) and its mtime.
 pub(crate) struct Index {
     /// The mtime of the real directory when it was last seen by a new
@@ -93,6 +198,8 @@ pub(crate) struct DirState {
     /// Never empty. The canonical id from `.cd-dir` comes first.
     pub(crate) dir_ids: Vec<DirId>,
     shared: Arc<SharedDir>,
+    /// The key of `shared` in `shared_dirs`.
+    shared_key: SharedKey,
     /// The `Index::version` this state was built at.
     version: u64,
     /// Unique per built state. A cached child is only valid while its parent
@@ -172,11 +279,31 @@ impl CryptoFs {
             .cloned()
     }
 
+    /// Puts `state` into the fd cache. A state that leaves it hands its
+    /// shared data (and so its listing) to `KeptDirs`.
     fn store(&self, path: &VPath, state: &Arc<DirState>) {
-        self.cache
+        let left = self
+            .cache
             .lock()
             .expect("cache lock poisoned")
-            .put(path.clone(), Arc::clone(state));
+            .push(path.clone(), Arc::clone(state));
+        if let Some((_, old)) = left {
+            self.keep_shared(&old);
+        }
+    }
+
+    /// Hands the shared data of `state` to `KeptDirs`. The weight is read
+    /// without waiting: a listing that another request builds right now
+    /// counts as one entry.
+    fn keep_shared(&self, state: &DirState) {
+        let entries = match state.shared.index.try_lock() {
+            Ok(index) => index.listing.as_ref().map_or(0, |l| l.entries.len()),
+            Err(_) => 0,
+        };
+        self.kept_dirs
+            .lock()
+            .expect("kept dirs lock poisoned")
+            .keep(state.shared_key, Arc::clone(&state.shared), 1 + entries);
     }
 
     /// Returns the state of the directory at `path`, from the cache if the
@@ -206,26 +333,19 @@ impl CryptoFs {
     /// the canonical id `id`, and its version. If the stored mtime is not
     /// the one in `st`, this is an outside change: the index is dropped and
     /// the version counts up.
-    fn shared_dir(&self, st: &Stat, id: &DirId) -> (Arc<SharedDir>, u64) {
+    fn shared_dir(&self, st: &Stat, id: &DirId) -> (Arc<SharedDir>, SharedKey, u64) {
         let key = (st.dev, st.ino, *id);
         let shared = {
             let mut dirs = self.shared_dirs.lock().expect("shared dirs poisoned");
-            match dirs.get(&key).and_then(Weak::upgrade) {
+            match dirs.map.get(&key).and_then(Weak::upgrade) {
                 Some(shared) => shared,
                 None => {
-                    if dirs.len() >= SHARED_DIRS_PRUNE {
-                        dirs.retain(|_, w| w.strong_count() > 0);
+                    if dirs.map.len() >= dirs.prune_at {
+                        dirs.map.retain(|_, w| w.strong_count() > 0);
+                        dirs.prune_at = SHARED_DIRS_PRUNE.max(2 * dirs.map.len());
                     }
-                    let shared = Arc::new(SharedDir {
-                        change: Mutex::new(()),
-                        index: Mutex::new(Index {
-                            mtime: st.mtime,
-                            version: 0,
-                            listing: None,
-                        }),
-                        warned_extra_ids: AtomicBool::new(false),
-                    });
-                    dirs.insert(key, Arc::downgrade(&shared));
+                    let shared = Arc::new(SharedDir::new(st.mtime));
+                    dirs.map.insert(key, Arc::downgrade(&shared));
                     shared
                 }
             }
@@ -240,7 +360,7 @@ impl CryptoFs {
             }
             index.version
         };
-        (shared, version)
+        (shared, key, version)
     }
 
     /// Runs the own change `f` on the states of the directories at `paths`
@@ -338,11 +458,12 @@ impl CryptoFs {
         {
             return Ok(s);
         }
-        let (shared, version) = self.shared_dir(&self.root.stat_self()?, &self.root_id);
+        let (shared, shared_key, version) = self.shared_dir(&self.root.stat_self()?, &self.root_id);
         let state = Arc::new(DirState {
             handle: Arc::clone(&self.root),
             dir_ids: vec![self.root_id],
             shared,
+            shared_key,
             version,
             generation: self.new_generation(),
             parent_generation: None,
@@ -378,11 +499,12 @@ impl CryptoFs {
         if dir_ids[0] != entry.entry_id {
             return Err(Error::AuthFailed { what: entry.real });
         }
-        let (shared, version) = self.shared_dir(&st, &dir_ids[0]);
+        let (shared, shared_key, version) = self.shared_dir(&st, &dir_ids[0]);
         Ok(Arc::new(DirState {
             handle: Arc::new(handle),
             dir_ids,
             shared,
+            shared_key,
             version,
             generation: self.new_generation(),
             parent_generation: Some(parent.generation),
@@ -586,5 +708,55 @@ fn remove_incomplete(
         Ok(()) | Err(Error::NotFound) => Error::NotFound,
         Err(Error::NotEmpty) => invalid(real.to_owned()),
         Err(e) => e,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir() -> Arc<SharedDir> {
+        Arc::new(SharedDir::new(SystemTime::UNIX_EPOCH))
+    }
+
+    fn key(n: u64) -> SharedKey {
+        (0, n, [0u8; 16])
+    }
+
+    #[test]
+    fn kept_dirs_stay_within_the_entry_budget() {
+        let mut kept = KeptDirs::new(10);
+        kept.keep(key(1), dir(), 4);
+        kept.keep(key(2), dir(), 4);
+        assert_eq!((kept.len(), kept.weight()), (2, 8));
+        // 8 + 4 > 10: the least recently kept one goes.
+        kept.keep(key(3), dir(), 4);
+        assert_eq!((kept.len(), kept.weight()), (2, 8));
+        assert!(!kept.contains(&key(1)));
+        // Keeping one again moves it to the front and takes its new weight.
+        kept.keep(key(2), dir(), 1);
+        kept.keep(key(4), dir(), 5);
+        assert_eq!((kept.len(), kept.weight()), (3, 10));
+        // Now 3 is the least recent one.
+        kept.keep(key(5), dir(), 1);
+        assert_eq!((kept.len(), kept.weight()), (3, 7));
+        assert!(!kept.contains(&key(3)));
+        assert!(kept.contains(&key(2)) && kept.contains(&key(4)));
+        // One that is heavier than the whole budget is not kept, and an
+        // older entry with its key goes too.
+        kept.keep(key(4), dir(), 11);
+        assert!(!kept.contains(&key(4)));
+        assert_eq!((kept.len(), kept.weight()), (2, 2));
+    }
+
+    #[test]
+    fn a_dropped_kept_dir_is_freed() {
+        let mut kept = KeptDirs::new(2);
+        let d = dir();
+        let weak = Arc::downgrade(&d);
+        kept.keep(key(1), d, 1);
+        assert!(weak.upgrade().is_some());
+        kept.keep(key(2), dir(), 2);
+        assert!(weak.upgrade().is_none());
     }
 }

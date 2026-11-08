@@ -4,7 +4,7 @@ Guide for Claude Code sessions in this repository. Read it fully at the start
 of every session. Last full project scan: 2026-11-01 (branch `main`,
 commit `34a0dee`, plus the open-file limit work). Last change: 2026-11-08
 (review findings S1 mode bits, S2 chmod without links, S3 key hygiene,
-R1 + R2 never drop buffered data).
+R1 + R2 never drop buffered data, P1 kept listings).
 
 ## 0. Rules for Claude (always)
 
@@ -145,7 +145,7 @@ without a mount.
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
 | `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. Every flush runs `check_space` first (`space_needed`: growth + every rewritten chunk, an upper bound for copy-on-write file systems); `write` flushes **before** it takes data that would overflow the buffer, so a failed write changes nothing. Test hooks: `fail_chunk_writes_after`, `fake_free_space`. |
-| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
+| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd; a state that leaves it hands its `SharedDir` with the listing to `KeptDirs`, an fd-free LRU bounded by listing entries `KEPT_DIR_ENTRIES` 131 072, about 25 MiB; review P1): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
 | `rotate` | Offline, resumable master key rotation. |
@@ -368,7 +368,7 @@ Always first: `export PATH="$HOME/.cargo/bin:$PATH"`
 | macOS cross-check (no link) | `cargo clippy --workspace --target aarch64-apple-darwin -- -D warnings` and `cargo clippy -p crypto-drive-fuse -p crypto-drive --tests --target aarch64-apple-darwin -- -D warnings` (`--all-targets` fails: criterion's `alloca` needs a mac C compiler) |
 | Licenses / advisories | `cargo deny check` (advisories need network) |
 | License headers | `scripts/check-license-headers.sh` |
-| Benchmarks | `cargo bench -p crypto-drive-core --bench throughput` |
+| Benchmarks | `cargo bench -p crypto-drive-core --bench throughput` (groups: chunks, names, sequential, random 4K, `fs_tree_walk` 500 / 1500 dirs; compare with `-- <group> --save-baseline before`, then `--baseline before`) |
 | Mount tests (FUSE host only) | `cargo test -p crypto-drive-fuse --test mount -- --include-ignored` |
 | Smoke test (FUSE host only) | `cargo build --release && scripts/smoke-test.sh` |
 | Fuzzing | `fuzz/seeds.sh` then `scripts/fuzz.sh all 300` (nightly-2026-10-15, cargo-fuzz 0.13.2) |
@@ -384,7 +384,7 @@ State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
 10 ignored. After S2: 520 passed, 0 failed, 10 ignored. After S3: 524 passed,
-0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored.
+0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored.
 
 ## 8. Platform notes
 
@@ -511,14 +511,20 @@ and "Limits", `docs/format.md` section 8 notes.
   `set_mode` never follows links, README limit "needs /proc". S3 done
   2026-11-08 (commit `047aa37`), Linux container only: `sha2`/`hmac` with
   `zeroize`, `NameCipher` in a `LockedBox`, `ChunkCipher` swap gap in README
-  threat model and on the GitHub page. R1 + R2 done 2026-11-08, not yet
-  committed, Linux container only (spec
+  threat model and on the GitHub page. R1 + R2 done 2026-11-08 (commit
+  `68b680f`), Linux container only, mount tests on the Mac pending (spec
   `docs/superpowers/specs/2026-11-08-never-drop-dirty-data-design.md`, plan
   `docs/superpowers/plans/2026-11-08-never-drop-dirty-data.md`): orphans,
   free-space check before every flush, write without partial take, write
   errors logged at `error` (`log_level`, `WRITE_OPS` in the adapter), stop
-  and unmount wait for unwritten data; README, GitHub page. Next: S4 + S5
-  (daemon child), R3 (replaced real file under an open handle). Then: the longer-term items
+  and unmount wait for unwritten data; README, GitHub page. P1 done
+  2026-11-08, not yet committed, Linux container only (spec
+  `docs/superpowers/specs/2026-11-08-kept-listings-design.md`): `KeptDirs`;
+  tree walk of 1500 dirs 74.5 → 43.8 ms (−41 %). Possible next step: skip
+  `list` + `.cd-dir` read on a reload of a kept directory (touches the
+  binding check, needs an owner decision). Next: S4 + S5 (daemon child), R3
+  (replaced real file under an open handle; questions to the owner open),
+  P2 (worker pool on macOS). Then: the longer-term items
   (need owner decisions).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode

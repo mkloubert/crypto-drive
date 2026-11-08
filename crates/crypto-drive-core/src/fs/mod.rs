@@ -157,7 +157,9 @@ pub struct CryptoFs {
     /// The data every state of one real directory shares (change lock,
     /// name index, mtime), by (dev, ino) and canonical id of the real
     /// directory.
-    shared_dirs: Mutex<HashMap<(u64, u64, DirId), Weak<dirstate::SharedDir>>>,
+    shared_dirs: Mutex<dirstate::SharedDirs>,
+    /// Shared directory data (with listings) of states that left `cache`.
+    kept_dirs: Mutex<dirstate::KeptDirs>,
     next_generation: AtomicU64,
     /// The shared state of each open real file.
     open_files: Mutex<HashMap<RealFileId, Weak<Mutex<OpenFile>>>>,
@@ -188,7 +190,8 @@ impl CryptoFs {
             max_name_length: vault.marker.max_name_length,
             root_id: vault.marker.vault_id,
             cache: Mutex::new(LruCache::new(dir_cache_capacity(soft_open_file_limit()))),
-            shared_dirs: Mutex::new(HashMap::new()),
+            shared_dirs: Mutex::new(dirstate::SharedDirs::new()),
+            kept_dirs: Mutex::new(dirstate::KeptDirs::new(dirstate::KEPT_DIR_ENTRIES)),
             next_generation: AtomicU64::new(0),
             open_files: Mutex::new(HashMap::new()),
             orphans: Mutex::new(Vec::new()),
@@ -207,6 +210,7 @@ mod tests {
     use crate::testutil::{real_name_of, test_vault, test_vault_with};
     use crate::vault::{CONTROL_PREFIX, DIR_FILE, NAME_FILE, open_with_master_key};
     use dirstate::MAX_DIR_IDS;
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -740,6 +744,60 @@ mod tests {
         let fs = CryptoFs::new(open_with_master_key(&f.root, &f.mk).unwrap()).unwrap();
         let attr = fs.getattr(&p("d (conflict 1).txt")).unwrap();
         assert_eq!(attr.kind, FileKind::Directory);
+    }
+
+    /// `n` directories `d00`.. with one file each, and a directory cache
+    /// of only `cache` states (open fds).
+    fn many_dirs(f: &Fx, n: usize, cache: usize) -> Vec<String> {
+        let dirs: Vec<String> = (0..n).map(|i| format!("d{i:02}")).collect();
+        for d in &dirs {
+            f.fs.mkdir(&p(d), 0o755).unwrap();
+            let (_, h) = f.fs.create(&p(&format!("{d}/f")), 0o644).unwrap();
+            f.fs.release(h).unwrap();
+        }
+        f.fs.cache
+            .lock()
+            .unwrap()
+            .resize(NonZeroUsize::new(cache).unwrap());
+        dirs
+    }
+
+    #[test]
+    fn directories_out_of_the_fd_cache_keep_their_listing() {
+        // Review P1: a tree with more directories than the fd cache built
+        // every listing again on each pass.
+        let f = fx();
+        let dirs = many_dirs(&f, 40, 16);
+        for d in &dirs {
+            assert_eq!(listed(&f.fs, d), vec!["f"]);
+        }
+        let built = listing::listings_built();
+        for d in &dirs {
+            assert_eq!(listed(&f.fs, d), vec!["f"]);
+            assert!(f.fs.getattr(&p(&format!("{d}/f"))).is_ok());
+        }
+        assert_eq!(
+            listing::listings_built(),
+            built,
+            "listings were built again"
+        );
+        assert!(f.fs.cache.lock().unwrap().len() <= 16, "fds stay bounded");
+    }
+
+    #[test]
+    fn a_kept_listing_sees_outside_changes() {
+        let f = fx();
+        let dirs = many_dirs(&f, 40, 16);
+        for d in &dirs {
+            listed(&f.fs, d);
+        }
+        // d00 left the fd cache long ago; its listing is still kept.
+        let fs2 = CryptoFs::new(open_with_master_key(&f.root, &f.mk).unwrap()).unwrap();
+        fs2.mkdir(&p("d00/new"), 0o755).unwrap();
+        fs2.unlink(&p("d01/f")).unwrap();
+        assert_eq!(listed(&f.fs, "d00"), vec!["f", "new"]);
+        assert!(listed(&f.fs, "d01").is_empty());
+        assert!(matches!(f.fs.getattr(&p("d01/f")), Err(Error::NotFound)));
     }
 
     #[test]

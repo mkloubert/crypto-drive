@@ -145,11 +145,55 @@ fn fs_random_4k_writes(c: &mut Criterion) {
     fs.release(fh).expect("release");
 }
 
+/// A tree of `dirs` directories under the root with `files` empty files
+/// each, like a `node_modules` or a git checkout.
+fn tree_fs(dirs: usize, files: usize) -> (tempfile::TempDir, CryptoFs, Vec<VPath>) {
+    let (tmp, fs) = new_fs();
+    let mut paths = Vec::with_capacity(dirs);
+    for d in 0..dirs {
+        let dir = VPath::parse(&format!("/d{d:05}")).expect("path");
+        fs.mkdir(&dir, 0o755).expect("mkdir");
+        for f in 0..files {
+            let file = VPath::parse(&format!("/d{d:05}/file{f:02}.js")).expect("path");
+            let (_, fh) = fs.create(&file, 0o644).expect("create");
+            fs.release(fh).expect("release");
+        }
+        paths.push(dir);
+    }
+    (tmp, fs, paths)
+}
+
+/// One pass over the tree: list every directory and stat every entry
+/// (what `ls -lR`, `git status` or an IDE indexer does).
+fn walk(fs: &CryptoFs, dirs: &[VPath]) {
+    for dir in dirs {
+        for entry in fs.readdir(dir).expect("readdir") {
+            let path = dir.join(&entry.name).expect("path");
+            black_box(fs.getattr(&path).expect("getattr"));
+        }
+    }
+}
+
+fn fs_tree_walk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fs_tree_walk");
+    group.sample_size(10);
+    // 500 directories fit in the directory cache (at most 1024 states),
+    // 1500 do not.
+    for dirs in [500, 1500] {
+        let (_tmp, fs, paths) = tree_fs(dirs, 10);
+        walk(&fs, &paths);
+        group.throughput(Throughput::Elements(dirs as u64));
+        group.bench_function(format!("{dirs}_dirs"), |b| b.iter(|| walk(&fs, &paths)));
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     chunk_seal_open,
     name_encrypt_decrypt,
     fs_sequential_write_read_16mib,
-    fs_random_4k_writes
+    fs_random_4k_writes,
+    fs_tree_walk
 );
 criterion_main!(benches);
