@@ -424,6 +424,8 @@ mod tests {
         write_file(&f.fs, "a/x", b"x");
         write_file(&f.fs, "b/y", b"y");
         f.fs.mkdir(&p("a/sub"), 0o755).unwrap();
+        // Settle: listings built after the racy window are not built again.
+        f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
         assert_eq!(listed(&f.fs, "a"), vec!["sub", "x"]);
         assert_eq!(listed(&f.fs, "b"), vec!["y"]);
         assert_eq!(listed(&f.fs, "/"), vec!["a", "b"]);
@@ -768,6 +770,7 @@ mod tests {
         let mut copy = real.clone().into_os_string();
         copy.push(" (1)");
         std::fs::copy(&real, &copy).unwrap();
+        f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
         assert_eq!(listed(&f.fs, "/"), vec!["a (conflict 1).txt", "a.txt"]);
         f.fs.rename(&p("a (conflict 1).txt"), &p("b.txt")).unwrap();
         assert_eq!(listed(&f.fs, "/"), vec!["a.txt", "b.txt"]);
@@ -848,6 +851,8 @@ mod tests {
         let enc = f.real(name);
         let real = f.root.join(&enc);
         std::fs::copy(&real, f.root.join(format!("{enc} (1)"))).unwrap();
+        // An outside change: seen at once only after the racy window.
+        f.fs.advance_clock(crate::fs::dirstate::RACY_WINDOW);
     }
 
     #[test]

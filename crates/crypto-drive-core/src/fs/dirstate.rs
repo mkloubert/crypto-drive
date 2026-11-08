@@ -90,13 +90,14 @@ pub(crate) struct SharedDir {
 }
 
 impl SharedDir {
-    /// New shared data of a real directory with the mtime `mtime` and no
-    /// listing yet.
-    pub(crate) fn new(mtime: SystemTime) -> SharedDir {
+    /// New shared data of a real directory with the mtime `mtime`, read at
+    /// the wall time `now`, and no listing yet.
+    pub(crate) fn new(mtime: SystemTime, now: SystemTime) -> SharedDir {
         SharedDir {
             change: Mutex::new(()),
             index: Mutex::new(Index {
                 mtime,
+                racy: is_racy(mtime, now),
                 version: 0,
                 listing: None,
             }),
@@ -186,11 +187,34 @@ pub(crate) struct Index {
     /// The mtime of the real directory when it was last seen by a new
     /// state, read again after each own change.
     mtime: SystemTime,
+    /// A change in the same tick as `mtime` may not have changed it, so a
+    /// listing must be built once more after `RACY_WINDOW` (spec 2026-11-08
+    /// coarse mtime). Sticky: later own changes do not clear it; only a
+    /// listing built after the window does.
+    racy: bool,
     /// Counts the outside changes seen: a new state found another mtime
     /// than `mtime`. A state with an older version is outdated.
     version: u64,
     /// Built on first use; own changes update it in place.
     pub(crate) listing: Option<Listing>,
+}
+
+impl Index {
+    /// True if the mtime is racy and its window has passed: the listing
+    /// must be built again to find a change of the same tick.
+    pub(crate) fn check_due(&self, now: SystemTime) -> bool {
+        self.racy && !is_racy(self.mtime, now)
+    }
+
+    /// Notes that a listing was built that was read at or after the wall
+    /// time `now`. If the mtime was safe then, the listing holds every
+    /// change of its tick, so the racy mark goes (spec 2026-11-08 coarse
+    /// mtime, 3.2).
+    pub(crate) fn listing_built_at(&mut self, now: SystemTime) {
+        if !is_racy(self.mtime, now) {
+            self.racy = false;
+        }
+    }
 }
 
 /// What is known about one real directory.
@@ -249,14 +273,28 @@ impl DirState {
     }
 
     /// True if the real directory did not change from outside since this
-    /// state was built or last changed by us.
-    fn is_current(&self) -> bool {
+    /// state was built or last changed by us. False also once a racy mtime
+    /// is past its window: then the listing is built once more.
+    fn is_current(&self, now: SystemTime) -> bool {
         let Ok(st) = self.handle.stat_self() else {
             return false;
         };
         let index = self.index();
-        self.is_latest(&index) && st.mtime == index.mtime
+        self.is_latest(&index) && st.mtime == index.mtime && !index.check_due(now)
     }
+}
+
+/// A directory mtime that was read less than this after it was set is
+/// racy: a change in the same mtime tick may follow without a new mtime
+/// (Linux before 6.13: a few milliseconds, FAT: 2 s). Spec 2026-11-08
+/// coarse mtime, 3.1.
+pub(crate) const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+/// True if the mtime `mtime`, read at the wall time `now`, is racy. A
+/// mtime in the future (another clock) counts as racy.
+fn is_racy(mtime: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(mtime)
+        .map_or(true, |age| age < RACY_WINDOW)
 }
 
 /// The index key of the clear name `name`: its NFC form.
@@ -321,7 +359,7 @@ impl CryptoFs {
         let parent = self.dir_state(&parent_path)?;
         if let Some(s) = self.cached(path)
             && s.parent_generation == Some(parent.generation)
-            && s.is_current()
+            && s.is_current(self.now())
         {
             return Ok(s);
         }
@@ -336,10 +374,17 @@ impl CryptoFs {
     }
 
     /// The shared data of the real directory `st` (from `stat_self`) with
-    /// the canonical id `id`, and its version. If the stored mtime is not
-    /// the one in `st`, this is an outside change: the index is dropped and
-    /// the version counts up.
-    fn shared_dir(&self, st: &Stat, id: &DirId) -> (Arc<SharedDir>, SharedKey, u64) {
+    /// the canonical id `id`, and its version; `now` is the wall time read
+    /// before `st`. If the stored mtime is not the one in `st`, this is an
+    /// outside change: the index is dropped and the version counts up. The
+    /// same happens for a racy mtime past its window (spec 2026-11-08
+    /// coarse mtime, 3.3).
+    fn shared_dir(
+        &self,
+        st: &Stat,
+        id: &DirId,
+        now: SystemTime,
+    ) -> (Arc<SharedDir>, SharedKey, u64) {
         let key = (st.dev, st.ino, *id);
         let shared = {
             let mut dirs = self.shared_dirs.lock().expect("shared dirs poisoned");
@@ -350,7 +395,7 @@ impl CryptoFs {
                         dirs.map.retain(|_, w| w.strong_count() > 0);
                         dirs.prune_at = SHARED_DIRS_PRUNE.max(2 * dirs.map.len());
                     }
-                    let shared = Arc::new(SharedDir::new(st.mtime));
+                    let shared = Arc::new(SharedDir::new(st.mtime, now));
                     dirs.map.insert(key, Arc::downgrade(&shared));
                     shared
                 }
@@ -359,8 +404,9 @@ impl CryptoFs {
         // Not under the map lock: building a listing holds `index` long.
         let version = {
             let mut index = shared.index.lock().expect("index lock poisoned");
-            if index.mtime != st.mtime {
+            if index.mtime != st.mtime || index.check_due(now) {
                 index.mtime = st.mtime;
+                index.racy = is_racy(st.mtime, now);
                 index.version += 1;
                 index.listing = None;
             }
@@ -393,7 +439,8 @@ impl CryptoFs {
                 .iter()
                 .map(|d| d.change.lock().expect("change lock poisoned"))
                 .collect();
-            if states.iter().all(|s| s.is_current()) {
+            let now = self.now();
+            if states.iter().all(|s| s.is_current(now)) {
                 let result = f(&states);
                 drop(guards);
                 return result;
@@ -434,11 +481,15 @@ impl CryptoFs {
     /// the change lock held; the index and mtime are shared by every state
     /// of the directory. Limit (HS 3.3): an outside change made after the
     /// `is_current` check in `with_change` and before this read is not
-    /// seen. It stays unseen as long as only own changes follow; the next
-    /// outside change of the directory makes the index be built again.
+    /// seen if it left the mtime unchanged (same tick); a racy mtime makes
+    /// the listing be built once more after `RACY_WINDOW` (spec 2026-11-08
+    /// coarse mtime). The racy mark is kept from earlier changes.
     pub(crate) fn refresh_mtime(&self, dir: &DirState) -> Result<()> {
+        let now = self.now();
         let mtime = dir.handle.stat_self()?.mtime;
-        dir.index().mtime = mtime;
+        let mut index = dir.index();
+        index.mtime = mtime;
+        index.racy |= is_racy(mtime, now);
         Ok(())
     }
 
@@ -473,12 +524,14 @@ impl CryptoFs {
 
     fn root_state(&self) -> Result<Arc<DirState>> {
         let root = VPath::root();
+        let now = self.now();
         if let Some(s) = self.cached(&root)
-            && s.is_current()
+            && s.is_current(now)
         {
             return Ok(s);
         }
-        let (shared, shared_key, version) = self.shared_dir(&self.root.stat_self()?, &self.root_id);
+        let (shared, shared_key, version) =
+            self.shared_dir(&self.root.stat_self()?, &self.root_id, now);
         let state = Arc::new(DirState {
             handle: Arc::clone(&self.root),
             dir_ids: vec![self.root_id],
@@ -499,7 +552,9 @@ impl CryptoFs {
         }
         let handle = parent.handle.open_dir(&entry.real)?;
         // Take the mtime before reading anything, so a change made while
-        // reading makes the state outdated instead of being missed.
+        // reading makes the state outdated instead of being missed. The
+        // wall time comes first (spec 2026-11-08 coarse mtime, 3.1).
+        let now = self.now();
         let st = handle.stat_self()?;
         let mtime = st.mtime;
         let mut names = handle.list()?;
@@ -539,7 +594,7 @@ impl CryptoFs {
         if dir_ids[0] != entry.entry_id {
             return Err(Error::AuthFailed { what: entry.real });
         }
-        let (shared, shared_key, version) = self.shared_dir(&st, &dir_ids[0]);
+        let (shared, shared_key, version) = self.shared_dir(&st, &dir_ids[0], now);
         Ok(Arc::new(DirState {
             handle: Arc::new(handle),
             dir_ids,
@@ -758,7 +813,10 @@ mod tests {
     use super::*;
 
     fn dir() -> Arc<SharedDir> {
-        Arc::new(SharedDir::new(SystemTime::UNIX_EPOCH))
+        Arc::new(SharedDir::new(
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+        ))
     }
 
     fn key(n: u64) -> SharedKey {
@@ -789,6 +847,17 @@ mod tests {
         kept.keep(key(4), dir(), 11);
         assert!(!kept.contains(&key(4)));
         assert_eq!((kept.len(), kept.weight()), (2, 2));
+    }
+
+    #[test]
+    fn racy_rule() {
+        let now = SystemTime::now();
+        assert!(is_racy(now, now));
+        assert!(is_racy(now - Duration::from_millis(1999), now));
+        assert!(!is_racy(now - RACY_WINDOW, now));
+        assert!(!is_racy(now - Duration::from_secs(3600), now));
+        // A mtime in the future (another clock) counts as racy.
+        assert!(is_racy(now + Duration::from_secs(60), now));
     }
 
     #[test]

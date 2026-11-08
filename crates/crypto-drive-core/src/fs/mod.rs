@@ -173,6 +173,9 @@ pub struct CryptoFs {
     handles: Mutex<HashMap<FileHandleId, files::Handle>>,
     /// The next file handle id; ids are never reused.
     next_handle: AtomicU64,
+    /// Test hook: added to the wall time (`now`).
+    #[cfg(test)]
+    clock_offset: Mutex<Duration>,
 }
 
 // The FUSE adapter shares one `CryptoFs` between threads.
@@ -201,7 +204,24 @@ impl CryptoFs {
             orphans: Mutex::new(Vec::new()),
             handles: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
+            #[cfg(test)]
+            clock_offset: Mutex::new(Duration::ZERO),
         })
+    }
+
+    /// The wall time, to tell a racy mtime from a safe one (spec
+    /// 2026-11-08 coarse mtime). Tests can move it forward.
+    pub(crate) fn now(&self) -> SystemTime {
+        let now = SystemTime::now();
+        #[cfg(test)]
+        let now = now + *self.clock_offset.lock().expect("clock offset poisoned");
+        now
+    }
+
+    /// Test hook: moves the clock of `now` forward by `by`.
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&self, by: Duration) {
+        *self.clock_offset.lock().expect("clock offset poisoned") += by;
     }
 }
 
@@ -661,6 +681,7 @@ mod tests {
         let fs2 = CryptoFs::new(v2).unwrap();
         fs2.mkdir(&p("x"), 0o755).unwrap();
         fs2.mkdir(&p("a/y"), 0o755).unwrap();
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
         assert_eq!(listed(&f.fs, "/"), vec!["a", "x"]);
         assert_eq!(listed(&f.fs, "a"), vec!["y"]);
     }
@@ -673,6 +694,7 @@ mod tests {
         assert_eq!(listed(&f.fs, "a"), vec!["b"]);
         let real_a = only_entry(&f.root);
         std::fs::rename(&real_a, f.root.join(".hidden")).unwrap();
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
         assert!(matches!(f.fs.readdir(&p("a")), Err(Error::NotFound)));
         assert!(matches!(f.fs.getattr(&p("a/b")), Err(Error::NotFound)));
     }
@@ -692,6 +714,7 @@ mod tests {
         std::fs::create_dir(real_d.join(&e)).unwrap();
         std::fs::write(real_d.join(&e).join(DIR_FILE), e_id).unwrap();
         std::fs::write(real_d.join(".cd-dir.tmp"), [0u8; 16]).unwrap();
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
         f.fs.mkdir(&p("d/g"), 0o755).unwrap();
         assert_eq!(listed(&f.fs, "d"), vec!["c", "e", "g"]);
         assert_eq!(f.fs.getattr(&p("d/c")).unwrap().kind, FileKind::Directory);
@@ -835,6 +858,7 @@ mod tests {
             std::fs::create_dir(&copy).unwrap();
             std::fs::copy(real.join(DIR_FILE), copy.join(DIR_FILE)).unwrap();
         }
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
         // N follows the real name order: " (1)" sorts before "-DESKTOP1".
         assert_eq!(
             listed(&f.fs, "/"),
@@ -882,6 +906,8 @@ mod tests {
         // every listing again on each pass.
         let f = fx();
         let dirs = many_dirs(&f, 40, 16);
+        // Settle: listings built after the racy window are not built again.
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
         for d in &dirs {
             assert_eq!(listed(&f.fs, d), vec!["f"]);
         }
@@ -914,16 +940,105 @@ mod tests {
         assert!(matches!(f.fs.getattr(&p("d01/f")), Err(Error::NotFound)));
     }
 
+    /// Sets the real mtime of `dir` back to `m`, so an outside change looks
+    /// as if it landed in the same mtime tick (a coarse mtime) on every
+    /// file system.
+    fn same_tick(dir: &Path, m: SystemTime) {
+        std::fs::File::open(dir).unwrap().set_modified(m).unwrap();
+    }
+
+    fn real_mtime(path: &Path) -> SystemTime {
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    /// Creates the file `path` through `fs` and closes it.
+    fn touch(fs: &CryptoFs, path: &str) {
+        let (_, h) = fs.create(&p(path), 0o644).unwrap();
+        fs.release(h).unwrap();
+    }
+
+    fn second_fs(f: &Fx) -> CryptoFs {
+        CryptoFs::new(open_with_master_key(&f.root, &f.mk).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn outside_change_in_the_same_tick_is_seen_after_the_window() {
+        // Spec 2026-11-08 coarse mtime: such a change stayed unseen until
+        // the next outside change.
+        let f = fx();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        assert!(listed(&f.fs, "d").is_empty());
+        let real_d = f.real("d");
+        let m = real_mtime(&real_d);
+        touch(&second_fs(&f), "d/x");
+        same_tick(&real_d, m);
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
+        assert_eq!(listed(&f.fs, "d"), vec!["x"]);
+        assert_eq!(f.fs.getattr(&p("d/x")).unwrap().kind, FileKind::File);
+    }
+
+    #[test]
+    fn racy_mark_survives_later_own_changes() {
+        let f = fx();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        assert!(listed(&f.fs, "d").is_empty());
+        let real_d = f.real("d");
+        let m = real_mtime(&real_d);
+        touch(&second_fs(&f), "d/x");
+        same_tick(&real_d, m);
+        // Own changes store the new mtime; the outside one must not be
+        // hidden by them.
+        touch(&f.fs, "d/y");
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
+        assert_eq!(listed(&f.fs, "d"), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn racy_kept_listing_is_checked_after_the_window() {
+        let f = fx();
+        let dirs = many_dirs(&f, 40, 16);
+        for d in &dirs {
+            listed(&f.fs, d);
+        }
+        // d00 left the fd cache; its listing lives only in `KeptDirs`.
+        let real_d = f.real("d00");
+        let m = real_mtime(&real_d);
+        touch(&second_fs(&f), "d00/x");
+        same_tick(&real_d, m);
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
+        assert_eq!(listed(&f.fs, "d00"), vec!["f", "x"]);
+    }
+
+    #[test]
+    fn a_resting_directory_is_not_listed_again() {
+        let f = fx();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
+        // Settles the root and "d": their listings are built after the
+        // window, so their mtimes are safe.
+        assert!(listed(&f.fs, "d").is_empty());
+        let built = listing::listings_built();
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
+        for _ in 0..3 {
+            assert!(listed(&f.fs, "d").is_empty());
+            assert!(f.fs.getattr(&p("d")).is_ok());
+        }
+        assert_eq!(listing::listings_built(), built);
+    }
+
     #[test]
     fn repeated_lookups_build_the_index_once() {
         let f = fx();
         f.fs.mkdir(&p("/d"), 0o755).unwrap();
+        // Settle: listings built after the racy window are not built again.
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
+        assert!(f.fs.getattr(&p("/d")).is_ok());
         let built = listing::listings_built();
         for _ in 0..10 {
             assert!(f.fs.getattr(&p("/d")).is_ok());
             assert!(matches!(f.fs.getattr(&p("/nope")), Err(Error::NotFound)));
         }
-        // mkdir built the index and kept it.
+        // The index was built once and kept.
         assert_eq!(listing::listings_built(), built);
     }
 
@@ -979,6 +1094,9 @@ mod tests {
     fn create_many_files_builds_index_once() {
         let f = fx();
         f.fs.mkdir(&p("d"), 0o755).unwrap();
+        // Settle: listings built after the racy window are not built again.
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
+        assert!(f.fs.getattr(&p("d")).is_ok());
         let built = listing::listings_built();
         let start = std::time::Instant::now();
         for i in 0..2000 {
@@ -986,6 +1104,10 @@ mod tests {
             assert!(matches!(f.fs.getattr(&path), Err(Error::NotFound)));
             let (_, h) = f.fs.create(&path, 0o644).unwrap();
             f.fs.release(h).unwrap();
+            if i == 1000 {
+                // A slow runner: the loop takes longer than the racy window.
+                f.fs.advance_clock(dirstate::RACY_WINDOW);
+            }
         }
         let took = start.elapsed();
         assert!(listing::listings_built() <= built + 1);
@@ -1075,6 +1197,7 @@ mod tests {
         let copy = f.root.join(format!("{real_name} (1)"));
         std::fs::create_dir(&copy).unwrap();
         std::fs::copy(real.join(DIR_FILE), copy.join(DIR_FILE)).unwrap();
+        f.fs.advance_clock(dirstate::RACY_WINDOW);
         assert_eq!(
             listed(&f.fs, "/"),
             vec!["d", "d (conflict 1)", "d (conflict 2)"]

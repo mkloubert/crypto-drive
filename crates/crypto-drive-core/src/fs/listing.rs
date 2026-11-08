@@ -210,6 +210,7 @@ impl CryptoFs {
         if let Some(l) = &index.listing {
             return Ok(f(l));
         }
+        let now = self.now();
         let listing = self.build_listing(state)?;
         // A listing that skipped unreadable entries is not kept, so they show
         // up as soon as they can be read (a chmod does not change the mtime).
@@ -217,6 +218,9 @@ impl CryptoFs {
         if listing.skipped.is_some() || !state.is_latest(&index) {
             return Ok(f(&listing));
         }
+        // Read after the stored mtime became safe, the listing holds every
+        // change of its tick (spec 2026-11-08 coarse mtime, 3.2).
+        index.listing_built_at(now);
         Ok(f(index.listing.insert(listing)))
     }
 

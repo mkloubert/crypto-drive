@@ -941,14 +941,17 @@ mod tests {
         assert_eq!(f.fs.getattr(&p("ro")).unwrap().mode & 0o777, 0o444);
         let h = f.fs.open(&p("ro"), false, false).unwrap();
         assert_eq!(f.fs.read(h, 0, 100).unwrap(), b"read me");
-        assert!(matches!(
-            f.fs.open(&p("ro"), true, false),
-            Err(Error::NotPermitted)
-        ));
-        assert!(matches!(
-            f.fs.truncate(&p("ro"), 0),
-            Err(Error::NotPermitted)
-        ));
+        // Root may open a 0o444 file for writing, so the real open works.
+        if !rustix::process::geteuid().is_root() {
+            assert!(matches!(
+                f.fs.open(&p("ro"), true, false),
+                Err(Error::NotPermitted)
+            ));
+            assert!(matches!(
+                f.fs.truncate(&p("ro"), 0),
+                Err(Error::NotPermitted)
+            ));
+        }
         f.fs.release(h).unwrap();
         assert_eq!(read_file(&f.fs, "ro"), b"read me");
     }

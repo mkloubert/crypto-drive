@@ -418,10 +418,10 @@ Not protected against:
 - Old key files keep working after `passwd` (use `rotate-key`).
 - The running drive finds outside changes (from a sync client) through the
   modification time of the real directory. A change in the same time tick as
-  your own change (FAT: 2 seconds) can stay unseen until the directory changes
-  again. The same holds for outside edits that do not change the modification
-  time of the parent directory (inside a long-name entry, or a `chmod` of an
-  entry).
+  your own change (Linux before 6.13: a few milliseconds, FAT: 2 seconds) is
+  seen about 2 seconds after the last change in that directory. Outside edits that do not change
+  the modification time of the parent directory (inside a long-name entry, or
+  a `chmod` of an entry) can stay unseen until the directory changes again.
 - The kernel keeps its cache of a file's content across opens while the
   real file is unchanged (same inode, size, mtime and ctime). An outside
   change in the same ctime tick (a few milliseconds) that keeps the size can
