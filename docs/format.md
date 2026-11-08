@@ -169,9 +169,17 @@ offset  length  field
 
 - The file holds 16 random bytes, the `dir_id`.
 - The root directory has no `.cd-dir`. Its `dir_id` is the `vault_id`.
-- A writer MUST write it atomically (temporary file `.cd-dir.tmp`, `fsync`,
-  `rename`) when it creates the directory. It MUST NOT change it afterwards.
+- A writer MUST write it through a temporary file (`.cd-dir.tmp`, then
+  `rename`) when it creates the directory, so no reader sees a partial
+  file. It MUST NOT change it afterwards.
+- A writer MAY defer the `fsync` of `.cd-dir` and of the new directory
+  until something in that directory is synced. It MUST sync `.cd-dir`, the
+  directory and the entry of the directory in its parent before it reports
+  a sync of anything inside that directory as done.
 - A directory without `.cd-dir` is incomplete (see section 9).
+- Non-normative note: the `dir_id` is also the entry id in the encrypted
+  name of the directory (section 6), so a lost `.cd-dir` can be rebuilt
+  from the parent.
 
 ## 6. Names and entry binding
 
@@ -322,8 +330,10 @@ Non-normative notes on what format version 1 does not hide or detect:
 
 - A directory is empty when it holds only control files. Any other entry,
   also a foreign one, makes it non-empty.
-- A directory without a valid `.cd-dir` is incomplete. If it is empty and
-  its modification time is more than 60 seconds old, a reader MAY remove it.
+- A directory without a valid `.cd-dir` is incomplete. An empty `.cd-dir`
+  (what a crash after a deferred sync can leave, section 5) counts as a
+  missing one. If the directory is empty and its modification time is more
+  than 60 seconds old, a reader MAY remove it.
   A younger one MUST NOT be removed (a sync client may not have written its
   `.cd-dir` yet); it is not found. Otherwise access fails with an I/O error.
 - Entries left by an interrupted sync are hidden and SHOULD be reported by a

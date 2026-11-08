@@ -22,6 +22,7 @@ mod files;
 pub(crate) mod listing;
 mod path;
 pub(crate) mod rename;
+pub(crate) mod unsynced;
 
 pub use path::VPath;
 
@@ -160,6 +161,8 @@ pub struct CryptoFs {
     shared_dirs: Mutex<dirstate::SharedDirs>,
     /// Shared directory data (with listings) of states that left `cache`.
     kept_dirs: Mutex<dirstate::KeptDirs>,
+    /// Real directories with changes that are not synced yet.
+    unsynced: Mutex<unsynced::Unsynced>,
     next_generation: AtomicU64,
     /// The shared state of each open real file.
     open_files: Mutex<HashMap<RealFileId, Weak<Mutex<OpenFile>>>>,
@@ -192,6 +195,7 @@ impl CryptoFs {
             cache: Mutex::new(LruCache::new(dir_cache_capacity(soft_open_file_limit()))),
             shared_dirs: Mutex::new(dirstate::SharedDirs::new()),
             kept_dirs: Mutex::new(dirstate::KeptDirs::new(dirstate::KEPT_DIR_ENTRIES)),
+            unsynced: Mutex::new(unsynced::Unsynced::new(unsynced::MAX_UNSYNCED_DIRS)),
             next_generation: AtomicU64::new(0),
             open_files: Mutex::new(HashMap::new()),
             orphans: Mutex::new(Vec::new()),
@@ -433,11 +437,120 @@ mod tests {
         f.fs.fsync(h, None).unwrap();
         assert!(crate::backing::take_synced_dirs().is_empty());
         f.fs.fsync(h, Some(&p("d/x"))).unwrap();
+        // `d` is new (its `.cd-dir` was not synced), so its entry in the
+        // root is synced too.
+        assert_eq!(
+            crate::backing::take_synced_dirs(),
+            vec![dev_ino(&f.real("d")), dev_ino(&f.root)]
+        );
+        f.fs.release(h).unwrap();
+    }
+
+    #[test]
+    fn fsync_syncs_a_directory_only_after_an_entry_change() {
+        // Review P4-a: SQLite and git call fsync often on the same file.
+        let f = fx();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        let (_, h) = f.fs.create(&p("d/x"), 0o644).unwrap();
+        f.fs.fsync(h, Some(&p("d/x"))).unwrap();
+        crate::backing::take_synced_dirs();
+        crate::backing::take_synced_files();
+        f.fs.write(h, 0, b"more").unwrap();
+        f.fs.fsync(h, Some(&p("d/x"))).unwrap();
+        assert!(crate::backing::take_synced_dirs().is_empty());
+        assert!(crate::backing::take_synced_files().is_empty());
+        f.fs.rename(&p("d/x"), &p("d/y")).unwrap();
+        f.fs.fsync(h, Some(&p("d/y"))).unwrap();
         assert_eq!(
             crate::backing::take_synced_dirs(),
             vec![dev_ino(&f.real("d"))]
         );
+        f.fs.fsync(h, Some(&p("d/y"))).unwrap();
+        assert!(crate::backing::take_synced_dirs().is_empty());
         f.fs.release(h).unwrap();
+    }
+
+    #[test]
+    fn mkdir_does_not_sync() {
+        // Review P5-b: npm, cargo or unzip make many directories and never
+        // call fsync.
+        let f = fx();
+        crate::backing::take_synced_dirs();
+        crate::backing::take_synced_files();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        assert!(crate::backing::take_synced_dirs().is_empty());
+        assert!(crate::backing::take_synced_files().is_empty());
+        assert_eq!(std::fs::read(f.real("d").join(DIR_FILE)).unwrap().len(), 16);
+        assert!(listed(&f.fs, "d").is_empty());
+    }
+
+    #[test]
+    fn fsync_in_new_directories_syncs_them_and_their_parents_once() {
+        let f = fx();
+        f.fs.mkdir(&p("a"), 0o755).unwrap();
+        f.fs.mkdir(&p("a/b"), 0o755).unwrap();
+        let (_, h) = f.fs.create(&p("a/b/x"), 0o644).unwrap();
+        crate::backing::take_synced_dirs();
+        crate::backing::take_synced_files();
+        f.fs.fsync(h, Some(&p("a/b/x"))).unwrap();
+        let (a, b) = (f.real("a"), real_child(&f, "a", "b"));
+        assert_eq!(
+            crate::backing::take_synced_dirs(),
+            vec![dev_ino(&b), dev_ino(&a), dev_ino(&f.root)]
+        );
+        assert_eq!(
+            crate::backing::take_synced_files(),
+            vec![DIR_FILE, DIR_FILE]
+        );
+        f.fs.fsync(h, Some(&p("a/b/x"))).unwrap();
+        assert!(crate::backing::take_synced_dirs().is_empty());
+        assert!(crate::backing::take_synced_files().is_empty());
+        f.fs.release(h).unwrap();
+    }
+
+    #[test]
+    fn fsyncdir_of_a_new_directory_syncs_its_dir_id_and_its_entry() {
+        let f = fx();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        crate::backing::take_synced_dirs();
+        crate::backing::take_synced_files();
+        f.fs.fsyncdir(&p("d")).unwrap();
+        assert_eq!(crate::backing::take_synced_files(), vec![DIR_FILE]);
+        assert_eq!(
+            crate::backing::take_synced_dirs(),
+            vec![dev_ino(&f.real("d")), dev_ino(&f.root)]
+        );
+        // An explicit fsyncdir always syncs the directory.
+        f.fs.fsyncdir(&p("d")).unwrap();
+        assert_eq!(
+            crate::backing::take_synced_dirs(),
+            vec![dev_ino(&f.real("d"))]
+        );
+        assert!(crate::backing::take_synced_files().is_empty());
+    }
+
+    #[test]
+    fn full_tracking_syncs_at_once() {
+        let f = fx();
+        f.fs.unsynced.lock().unwrap().set_cap(0);
+        crate::backing::take_synced_dirs();
+        crate::backing::take_synced_files();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        assert_eq!(crate::backing::take_synced_files(), vec![DIR_FILE]);
+        assert_eq!(
+            crate::backing::take_synced_dirs(),
+            vec![dev_ino(&f.real("d")), dev_ino(&f.root)]
+        );
+    }
+
+    /// The real path of the directory `name` inside the drive directory `dir`.
+    fn real_child(f: &Fx, dir: &str, name: &str) -> PathBuf {
+        let parent = f.real(dir);
+        let id: DirId = std::fs::read(parent.join(DIR_FILE))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        parent.join(real_name_of(&f.names, &id, &parent, name))
     }
 
     #[test]
@@ -474,9 +587,10 @@ mod tests {
         crate::backing::take_synced_dirs();
         f.fs.fsyncdir(&p("d")).unwrap();
         f.fs.fsyncdir(&VPath::root()).unwrap();
+        // `d` is new, so its entry in the root is synced with it.
         assert_eq!(
             crate::backing::take_synced_dirs(),
-            vec![dev_ino(&f.real("d")), dev_ino(&f.root)]
+            vec![dev_ino(&f.real("d")), dev_ino(&f.root), dev_ino(&f.root)]
         );
         assert!(matches!(f.fs.fsyncdir(&p("missing")), Err(Error::NotFound)));
     }
@@ -1076,6 +1190,47 @@ mod tests {
         backdate(&real);
         assert!(matches!(f.fs.readdir(&p("inc")), Err(Error::NotFound)));
         assert!(!real.exists());
+    }
+
+    fn fresh_fs(f: &Fx) -> CryptoFs {
+        CryptoFs::new(open_with_master_key(&f.root, &f.mk).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn empty_dir_id_after_a_crash_is_an_incomplete_dir() {
+        // P5-b: a crash after a deferred mkdir can keep the rename of
+        // `.cd-dir` but not its data.
+        let f = fx();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        let real = only_entry(&f.root);
+        std::fs::write(real.join(DIR_FILE), b"").unwrap();
+        assert!(matches!(
+            fresh_fs(&f).readdir(&p("d")),
+            Err(Error::NotFound)
+        ));
+        assert!(real.exists(), "a young one is kept");
+        backdate(&real);
+        assert!(matches!(
+            fresh_fs(&f).readdir(&p("d")),
+            Err(Error::NotFound)
+        ));
+        assert!(!real.exists(), "an old one is removed");
+    }
+
+    #[test]
+    fn empty_dir_id_next_to_entries_is_invalid_format() {
+        let f = fx();
+        f.fs.mkdir(&p("d"), 0o755).unwrap();
+        let (_, h) = f.fs.create(&p("d/x"), 0o644).unwrap();
+        f.fs.release(h).unwrap();
+        let real = only_entry(&f.root);
+        std::fs::write(real.join(DIR_FILE), b"").unwrap();
+        backdate(&real);
+        assert!(matches!(
+            fresh_fs(&f).readdir(&p("d")),
+            Err(Error::InvalidFormat { .. })
+        ));
+        assert!(real.exists());
     }
 
     #[test]

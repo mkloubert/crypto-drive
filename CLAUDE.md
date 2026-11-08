@@ -4,7 +4,8 @@ Guide for Claude Code sessions in this repository. Read it fully at the start
 of every session. Last full project scan: 2026-11-01 (branch `main`,
 commit `34a0dee`, plus the open-file limit work). Last change: 2026-11-08
 (review findings S1 mode bits, S2 chmod without links, S3 key hygiene,
-R1 + R2 never drop buffered data, P1 kept listings).
+R1 + R2 never drop buffered data, P1 kept listings, P4-a + P5-b fewer
+syncs).
 
 ## 0. Rules for Claude (always)
 
@@ -138,14 +139,14 @@ without a mount.
 
 | Module | Role |
 |---|---|
-| `backing` | The only place with syscalls on the real (encrypted) directory. Directory handles (`openat`, `renameat`, `unlinkat`, `mkdirat`) via `rustix`, so `PATH_MAX` does not apply. Never follows links: `set_mode` on Linux holds the entry with `O_PATH|O_NOFOLLOW`, checks it with `fstat` and chmods through `/proc/self/fd/N` (needs `/proc`); macOS `AT_SYMLINK_NOFOLLOW`; `set_file_mode` = `fchmod` on an open file (rotation). Test hook `BEFORE_CHMOD`. The part to port for Windows. |
+| `backing` | The only place with syscalls on the real (encrypted) directory. Directory handles (`openat`, `renameat`, `unlinkat`, `mkdirat`) via `rustix`, so `PATH_MAX` does not apply. Never follows links: `set_mode` on Linux holds the entry with `O_PATH|O_NOFOLLOW`, checks it with `fstat` and chmods through `/proc/self/fd/N` (needs `/proc`); macOS `AT_SYMLINK_NOFOLLOW`; `set_file_mode` = `fchmod` on an open file (rotation). `write_new_unsynced` (temp file + rename, no fsync) and `sync_file` for the deferred `.cd-dir`; test hooks `take_synced_dirs`, `take_synced_files`. Test hook `BEFORE_CHMOD`. The part to port for Windows. |
 | `vault` | `.cd-vault` marker, `init_vault`, `unlock_vault`, `open_with_master_key`, mount lock. |
 | `keyfile` | `.cd-key` format, password slots, Argon2 limits (`Argon2Params::MIN` for tests). Reader limits: `MAX_SLOTS` 16, `MAX_KEY_FILE_LEN` 64 KiB, regular file only (`load` opens with `O_NONBLOCK`, so a FIFO cannot block). |
 | `keys` | Key hierarchy: `MasterKey`, `KeySet` (1 or 2 epochs), HKDF sub keys, per-file keys, `DirId`. |
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
 | `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. Every flush runs `check_space` first (`space_needed`: growth + every rewritten chunk, an upper bound for copy-on-write file systems); `write` flushes **before** it takes data that would overflow the buffer, so a failed write changes nothing. Test hooks: `fail_chunk_writes_after`, `fake_free_space`. |
-| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd; a state that leaves it hands its `SharedDir` with the listing to `KeptDirs`, an fd-free LRU bounded by listing entries `KEPT_DIR_ENTRIES` 131 072, about 25 MiB; review P1): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`. |
+| `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd; a state that leaves it hands its `SharedDir` with the listing to `KeptDirs`, an fd-free LRU bounded by listing entries `KEPT_DIR_ENTRIES` 131 072, about 25 MiB; review P1): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`, `unsynced.rs` (which real directories need a sync; review P4-a / P5-b). |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
 | `rotate` | Offline, resumable master key rotation. |
@@ -237,7 +238,12 @@ Full rules: `docs/format.md`. Summary for orientation:
   update, new KATs and golden handling. Do not do it on the side.
 - Unauthenticated plaintext never leaves the core, not even in parts.
 - Control files and key files are written atomically: temp file, `fsync`,
-  `rename`, `fsync` of the directory.
+  `rename`, `fsync` of the directory. One exception (owner decision
+  2026-11-08, P5-b): `.cd-dir` of a new short-name directory is written
+  through a temp file without `fsync` (`write_new_unsynced`) and synced by
+  `sync_dir_chain` before anything in the directory is synced
+  (`docs/format.md` 5); an empty `.cd-dir` counts as missing (section 9).
+  `F_FULLFSYNC` for file syncs on macOS stays (owner decision).
 - New random nonce for every chunk write. All random values from the OS
   (`getrandom`).
 
@@ -368,7 +374,7 @@ Always first: `export PATH="$HOME/.cargo/bin:$PATH"`
 | macOS cross-check (no link) | `cargo clippy --workspace --target aarch64-apple-darwin -- -D warnings` and `cargo clippy -p crypto-drive-fuse -p crypto-drive --tests --target aarch64-apple-darwin -- -D warnings` (`--all-targets` fails: criterion's `alloca` needs a mac C compiler) |
 | Licenses / advisories | `cargo deny check` (advisories need network) |
 | License headers | `scripts/check-license-headers.sh` |
-| Benchmarks | `cargo bench -p crypto-drive-core --bench throughput` (groups: chunks, names, sequential, random 4K, `fs_tree_walk` 500 / 1500 dirs; compare with `-- <group> --save-baseline before`, then `--baseline before`) |
+| Benchmarks | `cargo bench -p crypto-drive-core --bench throughput` (groups: chunks, names, sequential, random 4K, `fs_tree_walk` 500 / 1500 dirs, `fs_mkdir`, `fs_fsync_loop`; compare with `-- <group> --save-baseline before`, then `--baseline before`) |
 | Mount tests (FUSE host only) | `cargo test -p crypto-drive-fuse --test mount -- --include-ignored` |
 | Smoke test (FUSE host only) | `cargo build --release && scripts/smoke-test.sh` |
 | Fuzzing | `fuzz/seeds.sh` then `scripts/fuzz.sh all 300` (nightly-2026-10-15, cargo-fuzz 0.13.2) |
@@ -384,7 +390,7 @@ State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
 10 ignored. After S2: 520 passed, 0 failed, 10 ignored. After S3: 524 passed,
-0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored.
+0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored. After P4-a + P5-b: 548 passed, 0 failed, 10 ignored.
 
 ## 8. Platform notes
 
@@ -518,13 +524,22 @@ and "Limits", `docs/format.md` section 8 notes.
   free-space check before every flush, write without partial take, write
   errors logged at `error` (`log_level`, `WRITE_OPS` in the adapter), stop
   and unmount wait for unwritten data; README, GitHub page. P1 done
-  2026-11-08, not yet committed, Linux container only (spec
+  2026-11-08 (commit `e688b8e`), Linux container only (spec
   `docs/superpowers/specs/2026-11-08-kept-listings-design.md`): `KeptDirs`;
   tree walk of 1500 dirs 74.5 → 43.8 ms (−41 %). Possible next step: skip
   `list` + `.cd-dir` read on a reload of a kept directory (touches the
   binding check, needs an owner decision). Next: S4 + S5 (daemon child), R3
   (replaced real file under an open handle; questions to the owner open),
-  P2 (worker pool on macOS). Then: the longer-term items
+  P2 (worker pool on macOS). P4-a + P5-b done 2026-11-08, not yet committed,
+  Linux container only (spec `docs/superpowers/specs/2026-11-08-fewer-syncs-design.md`):
+  `fs/unsynced.rs` (`Unsynced`: changed / new dirs by `(dev, ino)`, cap
+  `MAX_UNSYNCED_DIRS` 65 536, full → sync at once), marks in `end_change`,
+  deferred mkdir, `sync_dir_chain` for fsync / fsyncdir, empty `.cd-dir` =
+  incomplete; `fs_mkdir` 100 dirs 52.2 → 4.1 ms (−92 %), `fs_fsync_loop`
+  not measurable in the container (baseline noise), to measure on the Mac. Known residual risk (README): a crash after a new directory was
+  filled without fsync can leave it without its id; possible follow-up:
+  rebuild a lost `.cd-dir` from the entry id in the parent name (needs an
+  owner decision). Then: the longer-term items
   (need owner decisions).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode

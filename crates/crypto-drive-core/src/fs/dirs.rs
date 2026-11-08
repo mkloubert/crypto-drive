@@ -20,6 +20,7 @@
 use super::dirstate::{DIR_TMP_FILE, DirState, EntryRef, display_key};
 use super::listing::Layout;
 use super::path::VPath;
+use super::unsynced::DirKey;
 use super::{Attr, CryptoFs, DirEntry, FileKind, StatFs};
 use crate::backing::{DirHandle, Kind, Stat};
 use crate::content::plaintext_size;
@@ -96,13 +97,24 @@ fn real_name(backing: &BackingName) -> &str {
 
 /// Writes `.cd-name` (long names) and then `.cd-dir` with `dir_id` into a
 /// new directory. `.cd-dir` comes last, so a crash leaves an incomplete
-/// directory.
-fn init_new_dir(parent: &DirHandle, backing: &BackingName, dir_id: &DirId) -> Result<()> {
+/// directory. With `deferred`, `.cd-dir` is written without fsync; the
+/// caller marks the directory as new, and it is synced before anything in
+/// it is (review P5-b).
+fn init_new_dir(
+    parent: &DirHandle,
+    backing: &BackingName,
+    dir_id: &DirId,
+    deferred: bool,
+) -> Result<()> {
     let dir = parent.open_dir(real_name(backing))?;
     if let BackingName::Long { full, .. } = backing {
         dir.write_atomic(NAME_FILE, full.as_bytes(), CONTROL_FILE_MODE)?;
     }
-    dir.write_atomic(DIR_FILE, dir_id, CONTROL_FILE_MODE)
+    if deferred {
+        dir.write_new_unsynced(DIR_FILE, dir_id, CONTROL_FILE_MODE)
+    } else {
+        dir.write_atomic(DIR_FILE, dir_id, CONTROL_FILE_MODE)
+    }
 }
 
 /// Removes the three parts of a long file entry.
@@ -155,13 +167,20 @@ pub(super) fn remove_empty_dir(parent: &DirHandle, entry: &EntryRef) -> Result<(
 }
 
 /// Makes the new directory `backing` with `dir_id` in `parent` and returns
-/// its attributes. An incomplete directory is removed again (best effort).
-fn make_dir(parent: &DirHandle, backing: &BackingName, dir_id: &DirId, mode: u32) -> Result<Attr> {
+/// its attributes and its device and inode. An incomplete directory is
+/// removed again (best effort). `deferred`: see `init_new_dir`.
+fn make_dir(
+    parent: &DirHandle,
+    backing: &BackingName,
+    dir_id: &DirId,
+    mode: u32,
+    deferred: bool,
+) -> Result<(Attr, DirKey)> {
     let real = real_name(backing);
     let mode = mode & MODE_MASK;
     // The owner needs write access to add the control files.
     parent.mkdir(real, mode | OWNER_RWX)?;
-    if let Err(e) = init_new_dir(parent, backing, dir_id) {
+    if let Err(e) = init_new_dir(parent, backing, dir_id, deferred) {
         // Best effort: the directory is incomplete, so it may go.
         if let Ok(dir) = parent.open_dir(real) {
             let _ = dir.unlink(NAME_FILE);
@@ -177,7 +196,7 @@ fn make_dir(parent: &DirHandle, backing: &BackingName, dir_id: &DirId, mode: u32
         parent.set_mode(real, final_mode)?;
         st = parent.stat(real)?;
     }
-    Ok(dir_attr(&st))
+    Ok((dir_attr(&st), (st.dev, st.ino)))
 }
 
 impl CryptoFs {
@@ -209,9 +228,56 @@ impl CryptoFs {
     }
 
     /// Syncs the real directory of `path`, so the creates, renames and
-    /// removes in it are on the device (fsyncdir).
+    /// removes in it are on the device (fsyncdir). A new directory also
+    /// gets its `.cd-dir` and its entry in the parent synced.
     pub fn fsyncdir(&self, path: &VPath) -> Result<()> {
-        self.dir_state(path)?.handle.sync()
+        let state = self.dir_state(path)?;
+        self.sync_dir_chain(path, state, true)
+    }
+
+    /// Makes the entries of the directory at `path` durable, as far as this
+    /// process changed them (review P4-a, P5-b): a new directory syncs its
+    /// `.cd-dir` and itself, and then its parent goes the same way (its
+    /// entry there must be durable too); a changed directory syncs itself.
+    /// `force` syncs the first directory in any case (fsyncdir). A mark is
+    /// taken before the sync and put back if it fails.
+    pub(crate) fn sync_dir_chain(
+        &self,
+        path: &VPath,
+        state: Arc<DirState>,
+        force: bool,
+    ) -> Result<()> {
+        let (mut path, mut state, mut force) = (path.clone(), state, force);
+        loop {
+            let key = state.real_key();
+            let pending = self
+                .unsynced
+                .lock()
+                .expect("unsynced lock poisoned")
+                .take(key);
+            let result = (|| {
+                if pending.new {
+                    state.handle.sync_file(DIR_FILE)?;
+                }
+                if force || pending.changed || pending.new {
+                    state.handle.sync()?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                self.unsynced
+                    .lock()
+                    .expect("unsynced lock poisoned")
+                    .put_back(key, pending);
+                return Err(e);
+            }
+            let Some(parent) = path.parent().filter(|_| pending.new) else {
+                return Ok(());
+            };
+            state = self.dir_state(&parent)?;
+            path = parent;
+            force = false;
+        }
     }
 
     pub fn mkdir(&self, path: &VPath, mode: u32) -> Result<Attr> {
@@ -224,7 +290,21 @@ impl CryptoFs {
             // The entry id of a directory is its directory id (HS 3.2).
             let dir_id = random_entry_id()?;
             let backing = self.new_entry_name(parent, &dir_id, name)?;
-            let result = make_dir(&parent.handle, &backing, &dir_id, mode);
+            // Long names stay synced at once: they are rare, and their
+            // `.cd-name` would need its own crash rules.
+            let deferred = matches!(backing, BackingName::Short(_))
+                && self
+                    .unsynced
+                    .lock()
+                    .expect("unsynced lock poisoned")
+                    .has_room_for_new();
+            let result =
+                make_dir(&parent.handle, &backing, &dir_id, mode, deferred).map(|(attr, key)| {
+                    if deferred {
+                        self.note_new_dir(&parent.handle, &backing, key);
+                    }
+                    attr
+                });
             if result.is_ok() {
                 let entry = self.new_entry_ref(&backing, true, dir_id);
                 self.index_insert(parent, display_key(name), entry)?;
@@ -232,6 +312,25 @@ impl CryptoFs {
             self.end_change(parent, result.is_ok());
             result
         })
+    }
+
+    /// Marks a directory made by a deferred mkdir. If the tracking filled
+    /// up in the meantime, it is synced now.
+    fn note_new_dir(&self, parent: &DirHandle, backing: &BackingName, key: DirKey) {
+        if self
+            .unsynced
+            .lock()
+            .expect("unsynced lock poisoned")
+            .mark_new(key)
+        {
+            return;
+        }
+        let synced = parent
+            .open_dir(real_name(backing))
+            .and_then(|dir| dir.sync_file(DIR_FILE).and_then(|()| dir.sync()));
+        if let Err(e) = synced {
+            log::warn!("could not sync a new directory: {e}");
+        }
     }
 
     /// Resolves a non-root `path` to its parent state, parent path and entry.

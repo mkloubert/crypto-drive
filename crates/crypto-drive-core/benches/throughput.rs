@@ -188,12 +188,55 @@ fn fs_tree_walk(c: &mut Criterion) {
     group.finish();
 }
 
+/// `mkdir` of new directories, as npm, cargo or unzip do (no fsync).
+fn fs_mkdir(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fs_mkdir");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("100_dirs", |b| {
+        b.iter_batched(
+            new_fs,
+            |(_tmp, fs)| {
+                for d in 0..100 {
+                    let dir = VPath::parse(&format!("/d{d:03}")).expect("path");
+                    fs.mkdir(&dir, 0o755).expect("mkdir");
+                }
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+/// A small write and an fsync on the same file, again and again (a
+/// database commit). The entry does not change between the syncs.
+fn fs_fsync_loop(c: &mut Criterion) {
+    let (_tmp, fs) = new_fs();
+    let path = VPath::parse("/db/journal").expect("path");
+    fs.mkdir(&VPath::parse("/db").expect("path"), 0o755)
+        .expect("mkdir");
+    let (_, fh) = fs.create(&path, 0o644).expect("create");
+    fs.fsync(fh, Some(&path)).expect("fsync");
+    let mut group = c.benchmark_group("fs_fsync_loop");
+    group.sample_size(10);
+    group.bench_function("write_4KiB_fsync", |b| {
+        b.iter(|| {
+            fs.write(fh, 0, &[7u8; 4096]).expect("write");
+            fs.fsync(fh, Some(&path)).expect("fsync");
+        });
+    });
+    group.finish();
+    fs.release(fh).expect("release");
+}
+
 criterion_group!(
     benches,
     chunk_seal_open,
     name_encrypt_decrypt,
     fs_sequential_write_read_16mib,
     fs_random_4k_writes,
-    fs_tree_walk
+    fs_tree_walk,
+    fs_mkdir,
+    fs_fsync_loop
 );
 criterion_main!(benches);

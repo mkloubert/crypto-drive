@@ -58,6 +58,9 @@ pub struct Stat {
 thread_local! {
     /// Device and inode of each directory this thread synced.
     static SYNCED_DIRS: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Names of the control files this thread synced (`write_atomic`,
+    /// `sync_file`).
+    static SYNCED_FILES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Runs once in `set_mode` between the type check and the chmod, so a
     /// test can swap the entry in exactly that window.
     static BEFORE_CHMOD: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
@@ -75,6 +78,19 @@ fn before_chmod() {
 #[cfg(test)]
 pub(crate) fn take_synced_dirs() -> Vec<(u64, u64)> {
     SYNCED_DIRS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// Takes the names of the control files this thread synced since the last
+/// call.
+#[cfg(test)]
+pub(crate) fn take_synced_files() -> Vec<String> {
+    SYNCED_FILES.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// Records a control file sync for the tests.
+fn note_synced_file(_name: &str) {
+    #[cfg(test)]
+    SYNCED_FILES.with(|v| v.borrow_mut().push(_name.to_owned()));
 }
 
 /// An open directory in the real (encrypted) tree.
@@ -303,26 +319,59 @@ impl DirHandle {
 
     /// Writes `data` to `<name>.tmp`, syncs, and renames it over `name`.
     pub fn write_atomic(&self, name: &str, data: &[u8], mode: u32) -> Result<()> {
+        self.write_through_tmp(name, data, mode, true)
+    }
+
+    /// Like `write_atomic` (temporary file, `rename`), but without any
+    /// `fsync`. Other processes never see a partial file; after a crash the
+    /// file may be missing or empty. The caller syncs it later with
+    /// `sync_file` and `sync` (review P5).
+    pub fn write_new_unsynced(&self, name: &str, data: &[u8], mode: u32) -> Result<()> {
+        self.write_through_tmp(name, data, mode, false)
+    }
+
+    fn write_through_tmp(&self, name: &str, data: &[u8], mode: u32, sync: bool) -> Result<()> {
         check_name(name)?;
         let tmp = format!("{name}.tmp");
-        let result = self.write_atomic_inner(name, &tmp, data, mode);
+        let result = self.write_through_tmp_inner(name, &tmp, data, mode, sync);
         if result.is_err() {
             let _ = rustix::fs::unlinkat(&self.fd, tmp.as_str(), AtFlags::empty());
         }
         result
     }
 
-    fn write_atomic_inner(&self, name: &str, tmp: &str, data: &[u8], mode: u32) -> Result<()> {
+    fn write_through_tmp_inner(
+        &self,
+        name: &str,
+        tmp: &str,
+        data: &[u8],
+        mode: u32,
+        sync: bool,
+    ) -> Result<()> {
         let mut file = self.open_regular(
             tmp,
             OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
             mode_bits(mode),
         )?;
         file.write_all(data)?;
-        rustix::fs::fsync(&file).map_err(map_errno)?;
+        if sync {
+            rustix::fs::fsync(&file).map_err(map_errno)?;
+            note_synced_file(name);
+        }
         drop(file);
         rustix::fs::renameat(&self.fd, tmp, &self.fd, name).map_err(map_errno)?;
-        rustix::fs::fsync(&self.fd).map_err(map_errno)?;
+        if sync {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    /// Syncs the data of the regular file `name` (a control file written
+    /// with `write_new_unsynced`).
+    pub fn sync_file(&self, name: &str) -> Result<()> {
+        let file = self.open_regular(name, OFlags::RDONLY, Mode::empty())?;
+        rustix::fs::fsync(&file).map_err(map_errno)?;
+        note_synced_file(name);
         Ok(())
     }
 

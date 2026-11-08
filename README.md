@@ -435,9 +435,17 @@ Not protected against:
 - Creates, renames and removes reach the disk of the vault when the system
   writes them, not at once. An app that calls `fsync` on a file or a
   directory (databases, careful editors) gets them written: `fsync` of a file
-  also syncs the real directory of its entry, and `fsync` of a directory
-  syncs its real directory. A file that is being overwritten during a crash
-  can still be left part old and part new.
+  also syncs the real directory of its entry if the drive changed it since
+  its last sync, and `fsync` of a directory syncs its real directory. A file
+  that is being overwritten during a crash can still be left part old and
+  part new.
+- `mkdir` writes the new directory without a sync, so creating many
+  directories is fast. The directory is synced (with its id file
+  `.cd-dir`) before anything in it is synced. A crash or power cut shortly
+  after a new directory was filled by a program that never calls `fsync`
+  (for example `unzip`) can leave the directory without its id: then the
+  whole directory gives an error, not only the files that were not synced
+  yet. An empty such directory just disappears.
 - The drive keeps up to 4 MiB of new content per open file in memory. It
   writes it to the vault when the file is closed or synced, when it is
   more, about 5 seconds after the last write, and at the latest after

@@ -430,8 +430,11 @@ impl CryptoFs {
         }
     }
 
-    /// Syncs the real directory that holds the entry of `path` and, for a
-    /// long name, the `.cd-cdl` directory of the entry too.
+    /// Makes the entry of `path` durable: for a long name the `.cd-cdl`
+    /// directory of the entry (always, long names are rare), then the real
+    /// directory that holds the entry, if this process changed it since its
+    /// last sync, and new parent directories up the path (see
+    /// `sync_dir_chain`).
     fn sync_entry_dirs(&self, path: &VPath) -> Result<()> {
         let (Some(parent_path), Some(name)) = (path.parent(), path.name()) else {
             return Ok(());
@@ -441,7 +444,7 @@ impl CryptoFs {
         if matches!(entry.layout, Layout::LongFile) {
             parent.handle.open_dir(&entry.real)?.sync()?;
         }
-        parent.handle.sync()
+        self.sync_dir_chain(&parent_path, parent, false)
     }
 
     /// Flushes and drops the handle. The handle is gone even if the flush

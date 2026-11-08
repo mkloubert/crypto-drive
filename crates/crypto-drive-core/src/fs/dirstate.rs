@@ -19,6 +19,7 @@
 use super::CryptoFs;
 use super::listing::{Layout, Listing};
 use super::path::VPath;
+use super::unsynced::DirKey;
 use crate::backing::{DirHandle, Kind, Stat};
 use crate::error::{Error, Result};
 use crate::keys::{DirId, EntryId, Epoch};
@@ -218,6 +219,11 @@ impl DirState {
     /// True the first time it is called for this real directory.
     pub(crate) fn first_extra_id_warning(&self) -> bool {
         !self.shared.warned_extra_ids.swap(true, Ordering::Relaxed)
+    }
+
+    /// Device and inode of the real directory.
+    pub(crate) fn real_key(&self) -> DirKey {
+        (self.shared_key.0, self.shared_key.1)
     }
 
     /// The shared name index of the real directory.
@@ -441,6 +447,7 @@ impl CryptoFs {
     /// mtime cannot be read, the index is dropped and built again on the
     /// next use.
     pub(crate) fn end_change(&self, dir: &DirState, index_ok: bool) {
+        self.note_entry_change(dir);
         if !index_ok {
             dir.forget_listing();
             return;
@@ -448,6 +455,19 @@ impl CryptoFs {
         if let Err(e) = self.refresh_mtime(dir) {
             log::debug!("could not read the mtime of a changed directory: {e}");
             dir.forget_listing();
+        }
+    }
+
+    /// Marks an own entry change of `dir` for the next sync of it (review
+    /// P4-a). If the tracking is full, the directory is synced now.
+    fn note_entry_change(&self, dir: &DirState) {
+        let marked = self
+            .unsynced
+            .lock()
+            .expect("unsynced lock poisoned")
+            .mark_changed(dir.real_key());
+        if !marked && let Err(e) = dir.handle.sync() {
+            log::warn!("could not sync a changed directory: {e}");
         }
     }
 
@@ -493,7 +513,27 @@ impl CryptoFs {
                 mtime,
             ));
         }
-        let dir_ids = read_dir_ids(&handle, &entry.real, &names)?;
+        let dir_ids = match read_dir_ids(&handle, &entry.real, &names) {
+            Ok(ids) => ids,
+            // An empty `.cd-dir` is what a crash after a deferred mkdir can
+            // leave (the rename survived, the data not): it counts as a
+            // missing one (spec 2026-11-08 fewer syncs, 3.4). Any other
+            // wrong `.cd-dir` stays an error.
+            Err(e @ Error::InvalidFormat { .. }) => {
+                if matches!(handle.stat(DIR_FILE), Ok(st) if st.kind == Kind::File && st.size == 0)
+                {
+                    return Err(remove_incomplete(
+                        parent,
+                        &entry.real,
+                        &handle,
+                        &names,
+                        mtime,
+                    ));
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         // The canonical id must be the entry id of the name (HS 3.2), or
         // this is the subtree of another directory under this name.
         if dir_ids[0] != entry.entry_id {
@@ -680,9 +720,11 @@ fn remove_incomplete(
     names: &[String],
     mtime: SystemTime,
 ) -> Error {
+    // Only temporary files, and an empty `.cd-dir` (see `load_child`).
     let only_tmp = names.iter().all(|n| {
-        (n == DIR_TMP_FILE || n == NAME_TMP_FILE)
-            && matches!(handle.stat(n), Ok(st) if st.kind == Kind::File)
+        (n == DIR_TMP_FILE || n == NAME_TMP_FILE || n == DIR_FILE)
+            && matches!(handle.stat(n), Ok(st)
+                if st.kind == Kind::File && (n != DIR_FILE || st.size == 0))
     });
     if !only_tmp {
         return invalid(real.to_owned());
