@@ -287,6 +287,42 @@ fn cut_to_header() {
     assert!(matches!(r, Err(Error::InvalidFormat { .. })), "{r:?}");
 }
 
+/// A save with `O_TRUNC` (cut to 0, write again) gives the file a new key,
+/// so a chunk of the version before the cut no longer authenticates.
+#[test]
+fn old_chunk_after_truncate_fails() {
+    for (f, padded) in [(fx(), false), (fx_padded(), true)] {
+        let path = f.real("big.bin");
+        let at = chunk_offset(1, padded) as usize;
+        let full = (CHUNK_SIZE + CHUNK_OVERHEAD) as usize;
+        let old_chunk = std::fs::read(&path).unwrap()[at..at + full].to_vec();
+        let fs = f.fs();
+        fs.truncate(&p("big.bin"), 0).unwrap();
+        let h = fs.open(&p("big.bin"), true, false).unwrap();
+        fs.write(h, 0, &vec![0xCD; BIG_LEN]).unwrap();
+        fs.release(h).unwrap();
+        drop(fs);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[at..at + full].copy_from_slice(&old_chunk);
+        std::fs::write(&path, bytes).unwrap();
+        assert_auth_failed(f.read("big.bin"));
+    }
+}
+
+/// `ftruncate(0)` after `unlink` writes the new header into the same open
+/// real file.
+#[test]
+fn truncate_handle_after_unlink_works() {
+    let f = fx();
+    let fs = f.fs();
+    let h = fs.open(&p("big.bin"), true, false).unwrap();
+    fs.unlink(&p("big.bin")).unwrap();
+    fs.truncate_handle(h, 0).unwrap();
+    fs.write(h, 0, b"x").unwrap();
+    assert_eq!(fs.read(h, 0, 16).unwrap(), b"x");
+    fs.release(h).unwrap();
+}
+
 #[test]
 fn file_moved_to_another_directory() {
     let f = fx();

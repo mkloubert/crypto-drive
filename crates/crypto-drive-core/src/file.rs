@@ -52,9 +52,13 @@ pub struct OpenFile {
     cipher: ChunkCipher,
     /// The key of the size block; only in a padded vault.
     size_key: Option<SecretBytes<32>>,
+    /// A new header (after a cut to size 0) is in memory but not on disk
+    /// yet; the next flush writes it.
+    header_dirty: bool,
     /// Clear size in memory.
     plain_len: u64,
-    /// Clear size of the real file on disk.
+    /// Clear size of the real file on disk under the current key. 0 while
+    /// `header_dirty` is set: no chunk on disk opens with the new key.
     disk_len: u64,
     /// Clear chunks by index. A cached chunk may be shorter than its clear
     /// length; the missing bytes are zeros.
@@ -223,7 +227,9 @@ fn check_len(len: u64, padded: bool) -> Result<()> {
 /// disk are zeros (an empty vector). The result is cut to `plain_len`.
 fn load_chunk(f: &OpenFile, index: u64) -> Result<Vec<u8>> {
     let old_last = last_index(f.disk_len);
-    if index > old_last {
+    // With a new header not yet on disk (a cut to size 0), nothing on disk
+    // belongs to the current key: the file is zeros up to its size.
+    if index > old_last || f.header_dirty {
         return Ok(Vec::new());
     }
     let mut sealed = vec![0u8; chunk_len(f.disk_len, index) + CHUNK_OVERHEAD as usize];
@@ -337,6 +343,7 @@ impl OpenFile {
             header,
             cipher,
             size_key,
+            header_dirty: false,
             plain_len: len,
             disk_len: len,
             chunks: BTreeMap::new(),
@@ -516,9 +523,19 @@ impl OpenFile {
     }
 
     /// Sets the clear size and writes the result to disk.
-    pub fn truncate(&mut self, new_len: u64) -> Result<()> {
+    ///
+    /// A cut to size 0 (`O_TRUNC`, `ftruncate(0)`) also gives the file a new
+    /// header: a new random `file_nonce`, the same `file_id` and the write
+    /// epoch of `keys`. So chunks of a version from before the cut no longer
+    /// authenticate (no mixing of old and new chunks), and the nonce budget
+    /// of the key starts again (spec `2026-11-08-new-key-on-truncate`,
+    /// review SEC-4).
+    pub fn truncate(&mut self, new_len: u64, keys: &VaultKeys) -> Result<()> {
         self.check_writable()?;
         check_len(new_len, self.padded())?;
+        if new_len == 0 {
+            self.new_header(keys)?;
+        }
         if new_len < self.plain_len {
             let new_last = last_index(new_len);
             self.chunks.retain(|&i, _| i <= new_last);
@@ -537,6 +554,24 @@ impl OpenFile {
         result
     }
 
+    /// Makes a new header, chunk cipher and size key for the write epoch and
+    /// drops all chunks in memory (none of them may be written under the new
+    /// key). Only for a cut to size 0: the old chunks on disk do not open
+    /// with the new key. The next flush writes the header.
+    fn new_header(&mut self, keys: &VaultKeys) -> Result<()> {
+        let header = FileHeader::random(keys.write_epoch(), self.header.file_id)?;
+        let key = content_key(keys, &header)?;
+        self.cipher = ChunkCipher::new(key, &header);
+        self.size_key = self.padded().then(|| size_key(key, &header));
+        self.header = header;
+        self.header_dirty = true;
+        self.disk_len = 0;
+        self.chunks.clear();
+        self.dirty.clear();
+        self.last_use.clear();
+        Ok(())
+    }
+
     /// Sets the size in memory back to `len` after a failed grow.
     fn forget_growth(&mut self, len: u64) {
         let last = last_index(len);
@@ -550,7 +585,7 @@ impl OpenFile {
 
     /// True if changes in memory are not on disk yet.
     pub(crate) fn has_unwritten_changes(&self) -> bool {
-        !self.dirty.is_empty() || self.plain_len != self.disk_len
+        !self.dirty.is_empty() || self.plain_len != self.disk_len || self.header_dirty
     }
 
     /// Flushes if the unwritten changes have rested for `idle`, or if they
@@ -643,13 +678,15 @@ impl OpenFile {
         let growth = target.saturating_sub(self.file.metadata()?.len());
         let mut chunks = self.dirty.len() as u64;
         let mut extra = 0;
-        if self.plain_len != self.disk_len {
+        if self.plain_len != self.disk_len || self.header_dirty {
             let old_last = last_index(self.disk_len);
             let new_last = last_index(self.plain_len);
             chunks += u64::from(!self.dirty.contains(&new_last));
             if old_last < new_last {
                 chunks += u64::from(!self.dirty.contains(&old_last));
-                if padded {
+                // A new header rewrites the gap over old chunks, so it is not
+                // covered by the growth of the real file.
+                if padded || self.header_dirty {
                     let gap = new_last - old_last - 1;
                     let dirty_in_gap = self.dirty.range(old_last + 1..new_last).count() as u64;
                     chunks = chunks.saturating_add(gap - dirty_in_gap);
@@ -657,10 +694,13 @@ impl OpenFile {
             }
             if padded {
                 extra = SIZE_BLOCK_LEN;
-                if self.plain_len < self.disk_len {
+                if self.plain_len < self.disk_len || self.header_dirty {
                     extra += target - used_len(self.plain_len, true);
                 }
             }
+        }
+        if self.header_dirty {
+            extra += header_len(padded);
         }
         Ok(growth
             .saturating_add(chunks.saturating_mul(CHUNK_SIZE + CHUNK_OVERHEAD))
@@ -690,16 +730,34 @@ impl OpenFile {
         let padded = self.padded();
         let old_last = last_index(self.disk_len);
         // Not cached means the grow failed before it changed this chunk.
-        if let Some(chunk) = self.chunks.get(&old_last) {
+        // After a new header the chunk on disk is under the old key, so it
+        // is written in any case.
+        if self.header_dirty || self.chunks.contains_key(&old_last) {
             let len = chunk_len(self.disk_len, old_last);
-            let mut plain = chunk[..len.min(chunk.len())].to_vec();
+            let mut plain = self
+                .chunks
+                .get(&old_last)
+                .map(|c| c[..len.min(c.len())].to_vec())
+                .unwrap_or_default();
             plain.resize(len, 0);
             let sealed = self.cipher.seal(old_last, true, &plain)?;
             self.file
                 .write_all_at(&sealed, chunk_offset(old_last, padded))?;
         }
-        self.write_size_block(self.disk_len)?;
-        self.file.set_len(ciphertext_size(self.disk_len, padded))?;
+        let real_len = ciphertext_size(self.disk_len, padded);
+        if self.header_dirty {
+            // The old file is gone (the grow wrote chunks under the new
+            // key): leave the cut file, empty and readable.
+            self.write_header(self.disk_len)?;
+            self.file.set_len(real_len)?;
+            if padded {
+                write_padding(&self.file, used_len(self.disk_len, true), real_len)?;
+            }
+            self.header_dirty = false;
+        } else {
+            self.write_size_block(self.disk_len)?;
+            self.file.set_len(real_len)?;
+        }
         Ok(())
     }
 
@@ -721,9 +779,11 @@ impl OpenFile {
         }
         let old_last = last_index(self.disk_len);
         let new_last = last_index(self.plain_len);
-        if self.plain_len != self.disk_len {
+        if self.plain_len != self.disk_len || self.header_dirty {
             // The new last chunk changes its length or its "last" flag; when
-            // the file grows, the old last chunk loses its flag.
+            // the file grows, the old last chunk loses its flag. After a new
+            // header `disk_len` is 0, so every chunk up to the new end is
+            // written under the new key (dirty or as zeros).
             self.chunk_mut(new_last)?;
             self.dirty.insert(new_last);
             if old_last < new_last {
@@ -769,23 +829,43 @@ impl OpenFile {
                 .write_all_at(&sealed, chunk_offset(index, padded))?;
         }
         write_zeros(gap_next, gap_end)?;
+        if self.header_dirty {
+            // After the chunks, as for a shrink (format 7.2).
+            self.write_header(self.plain_len)?;
+        }
         if !padded {
             self.file.set_len(ciphertext_size(self.plain_len, false))?;
-        } else if self.plain_len != self.disk_len {
-            self.write_size_block(self.plain_len)?;
+        } else if self.plain_len != self.disk_len || self.header_dirty {
+            if !self.header_dirty {
+                self.write_size_block(self.plain_len)?;
+            }
             let real_len = ciphertext_size(self.plain_len, true);
             // A grow already has its length (this only cuts a longer file
             // left by a crash). A shrink cuts now and then replaces the old
             // chunk bytes after the last chunk with random bytes.
             self.file.set_len(real_len)?;
-            if !growing {
+            // After a new header the bytes after the last chunk may still
+            // hold old chunks: replace them too.
+            if !growing || self.header_dirty {
                 write_padding(&self.file, used_len(self.plain_len, true), real_len)?;
             }
         }
         self.disk_len = self.plain_len;
         self.dirty.clear();
+        self.header_dirty = false;
         self.idle_watch = None;
         self.trim_cache();
+        Ok(())
+    }
+
+    /// Writes the header and, in a padded vault, a new size block for the
+    /// clear size `len` in one write at offset 0.
+    fn write_header(&self, len: u64) -> Result<()> {
+        let mut bytes = self.header.to_bytes().to_vec();
+        if let Some(key) = &self.size_key {
+            bytes.extend_from_slice(&seal_size(key.expose(), &self.header.to_bytes(), len)?);
+        }
+        self.file.write_all_at(&bytes, 0)?;
         Ok(())
     }
 
@@ -1012,13 +1092,13 @@ mod tests {
             let mut f = new_file(&t);
             f.write(0, &data).unwrap();
             f.flush().unwrap();
-            f.truncate(70_000).unwrap();
+            f.truncate(70_000, &keys()).unwrap();
             drop(f);
             let mut g = reopen(&t);
             assert_eq!(g.len(), 70_000);
             assert_eq!(read_all(&mut g), &data[..70_000]);
             assert_eq!(disk_len(&t), size(&t, 70_000));
-            g.truncate(140_000).unwrap();
+            g.truncate(140_000, &keys()).unwrap();
             let mut expected = data[..70_000].to_vec();
             expected.resize(140_000, 0);
             assert_eq!(read_all(&mut g), expected);
@@ -1036,8 +1116,8 @@ mod tests {
             let data = pattern(200_000);
             let mut f = new_file(&t);
             f.write(0, &data).unwrap();
-            f.truncate(70_000).unwrap();
-            f.truncate(140_000).unwrap();
+            f.truncate(70_000, &keys()).unwrap();
+            f.truncate(140_000, &keys()).unwrap();
             let mut expected = data[..70_000].to_vec();
             expected.resize(140_000, 0);
             assert_eq!(read_all(&mut f), expected);
@@ -1053,12 +1133,187 @@ mod tests {
             let mut f = new_file(&t);
             f.write(0, &pattern(100_000)).unwrap();
             f.flush().unwrap();
-            f.truncate(0).unwrap();
+            f.truncate(0, &keys()).unwrap();
             assert_eq!(disk_len(&t), if padded { 4096 } else { 81 });
             drop(f);
             let mut g = reopen(&t);
             assert_eq!(g.len(), 0);
             assert!(g.read(0, 10).unwrap().is_empty());
+        });
+    }
+
+    /// The `file_nonce` in the header on disk.
+    fn disk_nonce(t: &Tmp) -> [u8; 32] {
+        let bytes = std::fs::read(&t.path).unwrap();
+        FileHeader::parse(&bytes[..HEADER_LEN as usize])
+            .unwrap()
+            .file_nonce
+    }
+
+    #[test]
+    fn old_chunk_after_cut_to_zero_fails() {
+        both(|padded| {
+            let t = tmp(padded);
+            let len = 3 * CS + 1000;
+            let mut f = new_file(&t);
+            f.write(0, &pattern(len)).unwrap();
+            f.flush().unwrap();
+            let at = usize::try_from(chunk_offset(1, padded)).unwrap();
+            let full = (CHUNK_SIZE + CHUNK_OVERHEAD) as usize;
+            let old_chunk = std::fs::read(&t.path).unwrap()[at..at + full].to_vec();
+            // An app saves with O_TRUNC: cut to 0, then write it again.
+            f.truncate(0, &keys()).unwrap();
+            f.write(0, &vec![0xAB; len]).unwrap();
+            f.flush().unwrap();
+            drop(f);
+            // Chunk 1 of the old version is put back at its place.
+            let mut bytes = std::fs::read(&t.path).unwrap();
+            bytes[at..at + full].copy_from_slice(&old_chunk);
+            std::fs::write(&t.path, bytes).unwrap();
+            let mut g = reopen(&t);
+            assert_eq!(g.read(0, 16).unwrap(), vec![0xAB; 16]);
+            let r = g.read(CHUNK_SIZE, 16);
+            assert!(matches!(r, Err(Error::AuthFailed { .. })), "{r:?}");
+        });
+    }
+
+    #[test]
+    fn cut_to_zero_writes_new_header() {
+        both(|padded| {
+            let t = tmp(padded);
+            let one = key_set(7);
+            let two = one.with_next(MasterKey::from_bytes([9; 32])).unwrap();
+            let both_keys = vault_keys(&two);
+            let mut f = new_file(&t);
+            f.write(0, b"old").unwrap();
+            f.flush().unwrap();
+            drop(f);
+            let old_nonce = disk_nonce(&t);
+            let mut g = try_open(&t, &both_keys).unwrap();
+            assert_eq!(g.epoch(), 1);
+            g.truncate(0, &both_keys).unwrap();
+            g.write(0, b"new").unwrap();
+            g.flush().unwrap();
+            assert_eq!(g.epoch(), 2);
+            drop(g);
+            assert_ne!(disk_nonce(&t), old_nonce);
+            let only_two = vault_keys(&two.only(2).unwrap());
+            let mut h = try_open(&t, &only_two).unwrap();
+            assert_eq!(h.epoch(), 2);
+            assert_eq!(h.file_id(), FILE_ID);
+            assert_eq!(read_all(&mut h), b"new");
+        });
+    }
+
+    #[test]
+    fn cut_to_zero_drops_unwritten_chunks() {
+        both(|padded| {
+            let t = tmp(padded);
+            let mut f = new_file(&t);
+            f.write(0, &pattern(2 * CS)).unwrap();
+            f.flush().unwrap();
+            f.write(0, b"zz").unwrap();
+            f.truncate(0, &keys()).unwrap();
+            f.flush().unwrap();
+            drop(f);
+            assert_eq!(disk_len(&t), size(&t, 0));
+            let mut g = reopen(&t);
+            assert_eq!(g.len(), 0);
+            assert!(g.read(0, 10).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn cut_to_zero_retries_after_failed_write() {
+        both(|padded| {
+            let t = tmp(padded);
+            let mut f = new_file(&t);
+            f.write(0, &pattern(2 * CS)).unwrap();
+            f.flush().unwrap();
+            fail_chunk_writes_after(Some(0));
+            let r = f.truncate(0, &keys());
+            fail_chunk_writes_after(None);
+            assert!(is_enospc(&r), "{r:?}");
+            assert_eq!(f.len(), 0);
+            assert!(f.read(0, 10).unwrap().is_empty());
+            // A write before the next try: nothing of the old chunks on disk
+            // may be loaded under the new key.
+            f.write(CS as u64 + 5, b"after").unwrap();
+            assert_eq!(f.read(0, 4).unwrap(), vec![0; 4]);
+            f.flush().unwrap();
+            drop(f);
+            let mut want = vec![0; CS + 5];
+            want.extend_from_slice(b"after");
+            assert_eq!(read_all(&mut reopen(&t)), want);
+        });
+    }
+
+    #[test]
+    fn failed_cut_for_space_then_offset_write_reads_back() {
+        both(|padded| {
+            let t = tmp(padded);
+            let mut f = new_file(&t);
+            f.write(0, &pattern(4 * CS)).unwrap();
+            f.flush().unwrap();
+            fake_free_space(Some(0));
+            let r = f.truncate(0, &keys());
+            fake_free_space(None);
+            assert!(is_enospc(&r), "{r:?}");
+            // Chunks 0 and 1 are never written after the cut: they must be
+            // zeros under the new key, not old chunks under the old one.
+            f.write(2 * CS as u64, b"after").unwrap();
+            f.flush().unwrap();
+            drop(f);
+            let mut want = vec![0; 2 * CS];
+            want.extend_from_slice(b"after");
+            assert_eq!(read_all(&mut reopen(&t)), want);
+        });
+    }
+
+    #[test]
+    fn failed_cut_write_then_sparse_write_reads_back() {
+        both(|padded| {
+            let t = tmp(padded);
+            let mut f = new_file(&t);
+            f.write(0, &pattern(4 * CS)).unwrap();
+            f.flush().unwrap();
+            fail_chunk_writes_after(Some(0));
+            let r = f.truncate(0, &keys());
+            fail_chunk_writes_after(None);
+            assert!(is_enospc(&r), "{r:?}");
+            f.write(3 * CS as u64, b"after").unwrap();
+            f.flush().unwrap();
+            drop(f);
+            let mut want = vec![0; 3 * CS];
+            want.extend_from_slice(b"after");
+            assert_eq!(read_all(&mut reopen(&t)), want);
+        });
+    }
+
+    #[test]
+    fn failed_grow_after_failed_cut_leaves_empty_file() {
+        both(|padded| {
+            let t = tmp(padded);
+            let mut f = new_file(&t);
+            f.write(0, &pattern(2 * CS)).unwrap();
+            f.flush().unwrap();
+            fake_free_space(Some(0));
+            let r = f.truncate(0, &keys());
+            fake_free_space(None);
+            assert!(is_enospc(&r), "{r:?}");
+            fail_chunk_writes_after(Some(2));
+            let r = f.truncate(10 * CHUNK_SIZE, &keys());
+            fail_chunk_writes_after(None);
+            assert!(is_enospc(&r), "{r:?}");
+            // A crash now: the undo leaves the cut file, empty and readable.
+            let mut g = reopen(&t);
+            assert_eq!(g.len(), 0);
+            assert!(read_all(&mut g).is_empty());
+            drop(g);
+            // The open file still works: the same grow succeeds now.
+            f.truncate(10 * CHUNK_SIZE, &keys()).unwrap();
+            drop(f);
+            assert_eq!(read_all(&mut reopen(&t)), vec![0; 10 * CS]);
         });
     }
 
@@ -1250,7 +1505,7 @@ mod tests {
                 let all = pattern(usize::try_from(len).unwrap());
                 f.write(cur, &all[usize::try_from(cur).unwrap()..]).unwrap();
             } else {
-                f.truncate(len).unwrap();
+                f.truncate(len, &keys()).unwrap();
             }
             f.flush().unwrap();
             drop(f);
@@ -1304,7 +1559,7 @@ mod tests {
         let mut f = new_file(&t);
         f.write(0, &pattern(5000)).unwrap();
         f.flush().unwrap();
-        f.truncate(100).unwrap();
+        f.truncate(100, &keys()).unwrap();
         drop(f);
         let used = usize::try_from(PADDED_HEADER_LEN + 28 + 100).unwrap();
         let mut bytes = std::fs::read(&t.path).unwrap();
@@ -1428,7 +1683,7 @@ mod tests {
             f.flush().unwrap();
             let start = std::time::Instant::now();
             // 1 PiB: more than any test machine has free.
-            assert!(is_enospc(&f.truncate(1 << 50)));
+            assert!(is_enospc(&f.truncate(1 << 50, &keys())));
             assert!(start.elapsed() < std::time::Duration::from_secs(5));
             assert_eq!(f.len(), 100_000);
             assert_eq!(disk_len(&t), size(&t, 100_000));
@@ -1451,7 +1706,7 @@ mod tests {
             f.write(0, &data).unwrap();
             f.flush().unwrap();
             fail_chunk_writes_after(Some(3));
-            let r = f.truncate(20 * CHUNK_SIZE);
+            let r = f.truncate(20 * CHUNK_SIZE, &keys());
             fail_chunk_writes_after(None);
             assert!(is_enospc(&r));
             assert_eq!(f.len(), 100_000);
@@ -1459,7 +1714,7 @@ mod tests {
             assert_eq!(read_all(&mut f), data);
             assert_eq!(read_all(&mut reopen(&t)), data);
             // The file still works: the same grow succeeds now.
-            f.truncate(20 * CHUNK_SIZE).unwrap();
+            f.truncate(20 * CHUNK_SIZE, &keys()).unwrap();
             drop(f);
             let mut want = data.clone();
             want.resize(20 * CS, 0);

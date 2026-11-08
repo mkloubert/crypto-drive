@@ -471,7 +471,7 @@ impl CryptoFs {
     pub fn truncate(&self, path: &VPath, len: u64) -> Result<()> {
         let loc = self.locate_path(path)?;
         let shared = self.open_shared(&loc, true)?;
-        let result = lock(&shared).truncate(len);
+        let result = lock(&shared).truncate(len, &self.keys);
         if let Err(e) = &result {
             self.keep_unwritten(&shared, e);
         }
@@ -511,7 +511,7 @@ impl CryptoFs {
         if !write {
             return Err(Error::NotPermitted);
         }
-        lock(&file).truncate(len)
+        lock(&file).truncate(len, &self.keys)
     }
 
     /// Flushes the open files whose unwritten changes rested for `idle` or

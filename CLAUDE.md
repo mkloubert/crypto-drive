@@ -6,7 +6,7 @@ commit `2ef9857`, full review in `REPORT.md`). Last change: 2026-11-08
 (review findings S1 mode bits, S2 chmod without links, S3 key hygiene,
 R1 + R2 never drop buffered data, P1 kept listings, P4-a + P5-b fewer
 syncs; new review SEC-/ROB-/PERF- ids; coarse-mtime fix after the first
-Debian 13 test run).
+Debian 13 test run; new file key on a cut to size 0, SEC-4 part).
 
 ## 0. Rules for Claude (always)
 
@@ -146,7 +146,7 @@ without a mount.
 | `keys` | Key hierarchy: `MasterKey`, `KeySet` (1 or 2 epochs), HKDF sub keys, per-file keys, `DirId`. |
 | `names` | AES-256-SIV names with entry id, NFC, overflow names `.cd-cdl<hash>`, `NameKeys::decrypt_any`. |
 | `content` | File header, chunks, size block, padding stages (`stage`). |
-| `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. Every flush runs `check_space` first (`space_needed`: growth + every rewritten chunk, an upper bound for copy-on-write file systems); `write` flushes **before** it takes data that would overflow the buffer, so a failed write changes nothing. Test hooks: `fail_chunk_writes_after`, `fake_free_space`. |
+| `file` | Random access to one encrypted file: LRU chunk cache, dirty buffer (64 chunks), grow/shrink, padded flush order. `flush_if_idle(now, idle, max_age)`: writes counter + `IdleWatch` (times come from the caller's ticks, writes need no clock); after a failed try the next one waits `max_age`. Every flush runs `check_space` first (`space_needed`: growth + every rewritten chunk, an upper bound for copy-on-write file systems); `write` flushes **before** it takes data that would overflow the buffer, so a failed write changes nothing. `truncate(len, keys)`: a cut to size 0 makes a new header (new `file_nonce`, same `file_id`, write epoch; `header_dirty` until the next flush writes it; meanwhile `disk_len` is 0, `load_chunk` reads nothing from disk and a failed grow leaves an empty file with the new header), so chunks of older versions no longer authenticate (SEC-4). Test hooks: `fail_chunk_writes_after`, `fake_free_space`. |
 | `fs/` | `CryptoFs`, the path-based file system (the directory cache size follows the soft `RLIMIT_NOFILE`: a quarter of it, 16 to 1024, because every cached directory holds an fd; a state that leaves it hands its `SharedDir` with the listing to `KeptDirs`, an fd-free LRU bounded by listing entries `KEPT_DIR_ENTRIES` 131 072, about 25 MiB; review P1): `mod.rs` (struct, caches, handles), `path.rs` (`VPath`), `dirstate.rs` (dir handle, ids capped at `MAX_DIR_IDS` 16 = canonical + first 15 copies by name, also used by `check`, rotation and `recover`; name index; racy mtimes: a mtime younger than `RACY_WINDOW` 2 s is checked once more after the window), `listing.rs` (readdir + conflict copies), `dirs.rs`, `files.rs`, `rename.rs`, `unsynced.rs` (which real directories need a sync; review P4-a / P5-b). |
 | `conflict` | Detection of sync conflict suffixes. |
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
@@ -391,7 +391,7 @@ State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
 10 ignored. After S2: 520 passed, 0 failed, 10 ignored. After S3: 524 passed,
-0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored. After P4-a + P5-b: 548 passed, 0 failed, 10 ignored. After the coarse-mtime fix: 553 passed, 0 failed, 10 ignored.
+0 failed, 10 ignored. After R1 + R2: 535 passed, 0 failed, 10 ignored. After P1: 539 passed, 0 failed, 10 ignored. After P4-a + P5-b: 548 passed, 0 failed, 10 ignored. After the coarse-mtime fix: 553 passed, 0 failed, 10 ignored. After the new key on a cut to size 0: 562 passed, 0 failed, 10 ignored.
 
 ## 8. Platform notes
 
@@ -421,7 +421,8 @@ tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
 ## 9. Known limits (by design, documented)
 
 No rollback detection; chunk mixing between versions of the same file is
-not detected; an extra `.cd-dir` copy allows undetected moves between
+not detected while it is written in place without a cut to size 0
+(databases, VM images; a cut to 0 gives a new key); an extra `.cd-dir` copy allows undetected moves between
 directories (warning + `check` finding `multiple-dir-ids`); xattrs in memory
 only; no symlinks / hard links / chown; rename replace is not atomic; `check`
 does not repair; deleting or bringing back entries is not detected; visible
@@ -580,8 +581,18 @@ and "Limits", `docs/format.md` section 8 notes.
   and `shared_dir` bumps the version, so the listing is built once more.
   `CryptoFs::now()`, test hook `advance_clock`. README limit changed
   (seen about 2 s after the last change in that directory).
+- New file key on a cut to size 0 done 2026-11-08, not yet committed,
+  Linux container only (spec
+  `docs/superpowers/specs/2026-11-08-new-key-on-truncate-design.md`, plan
+  `docs/superpowers/plans/2026-11-08-new-key-on-truncate.md`; owner
+  decisions: cut to 0 only, not a full rewrite; write epoch): no format
+  version change, `docs/format.md` 7 (SHOULD rule) and 11 (exception),
+  README threat model (mixing only for in-place writes, nonce budget),
+  GitHub page. Remaining SEC-4 part: files written in place keep one key.
+  Next from the criticality list: ROB-1, SEC-5, SEC-2, `passwd` hint to
+  `rotate-key`.
 - Open: per-flush file key (format change, would fix
-  chunk mixing); copy-on-write / journal for crash safety; stable inode
+  chunk mixing for in-place writes); copy-on-write / journal for crash safety; stable inode
   numbers; macOS "forking a threaded process" warning; daemon log target;
   encrypted persistent xattrs; `check --repair`; Windows backend.
 - Deferred small findings: `docs/superpowers/plans/2026-10-31-crypto-drive-mvp-followups.md`.

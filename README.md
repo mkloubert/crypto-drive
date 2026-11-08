@@ -336,11 +336,19 @@ Not protected against:
 - Rollback of a single file (or a name) to an older valid version, for
   example from the version history of a cloud. It is not detected. There is no
   write counter.
-- Mixing old and new chunks of the same file. All versions of a file use the
-  same file key, so a 64 KiB chunk from an older version of the file can
-  replace the chunk at the same place in the current version. The file then
-  holds parts of two versions, and no error is given. Chunks from other files
-  or other places in the file are still detected.
+- Mixing old and new chunks of a file that is changed in place. A file
+  keeps its key while it is written in place without being cut to size 0
+  (databases, VM images, `dd conv=notrunc`), so a 64 KiB chunk from an
+  older version of the file can replace the chunk at the same place in the
+  current version. The file then holds parts of two versions, and no error
+  is given. Chunks from other files or other places in the file are still
+  detected. A cut to size 0 (apps that save with `O_TRUNC`, the shell's
+  `>`) gives the file a new key, and apps that save through a new file and
+  a rename make a new file anyway: older versions of such files cannot be
+  mixed in. Such a file also keeps one key for all its chunk writes, each
+  with a random 96-bit nonce. The usual limit for random nonces is 2^32
+  writes per key; above it the risk of a nonce collision grows, and a
+  collision would allow forged chunks of that file.
 - Moves between directories with a planted `.cd-dir` copy. Extra `.cd-dir`
   files are allowed so that sync conflicts keep working (see "Cloud sync").
   Someone who can change the vault can move files or directories from

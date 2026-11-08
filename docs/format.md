@@ -261,6 +261,10 @@ padding:            random bytes (padded vault only)
   size block `AD`.
 - A reader MUST NOT return any plaintext of a chunk that fails authentication.
 - Content and name are independent. Rename and move MUST NOT change the content.
+- A writer SHOULD write a new header (a new random `file_nonce`, the same
+  `file_id`, the write epoch) when it cuts a file to size 0, so chunks of
+  earlier versions no longer authenticate. Readers are not affected: they
+  take the key from the header as always.
 
 ### 7.1 Not padded
 
@@ -406,7 +410,8 @@ and can be run again after a crash. Let `e` be the epoch of the marker.
 
 - While the key set has two epochs, a reader reads names and files of both
   epochs. New names and new files use epoch `e+1`. A changed file of epoch `e`
-  keeps epoch `e` until the next rotation run.
+  keeps epoch `e` until the next rotation run, except after a cut to size 0:
+  then it gets the write epoch (section 7).
 - File mode and times are kept. Directory modification times change.
 - Rotation does not undo past leaks.
 
