@@ -351,6 +351,13 @@ Not protected against:
   of old ciphertext plus an old key that someone already has. Until you run
   `rotate-key`, `passwd` does not change the master key: someone with an old
   copy of `.cd-key` and the old password can still open the vault.
+- Keys in swap, in part. Keys and passwords are wiped from memory after use
+  and locked in RAM (best effort; `mount` warns if locking fails). This
+  includes the master key, the sub keys and the expanded name cipher. Not
+  locked: the expanded AES key of each open file (it is still wiped when
+  the file is closed). It opens only that one file, but while the file is
+  open it can go to swap. Use encrypted swap (default on macOS) if this
+  matters.
 - Changed mode bits. The permissions (`rwx`) shown in the drive are the
   mode bits of the real files in the vault. They are not authenticated:
   someone who can change the vault (or a sync client that syncs

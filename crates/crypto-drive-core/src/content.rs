@@ -198,6 +198,11 @@ pub fn open_size(size_key: &[u8; 32], header: &[u8; 53], block: &[u8]) -> Result
 }
 
 /// Seals and opens the chunks of one file with its file key.
+///
+/// The expanded AES key is wiped on drop (`aes-gcm` with `zeroize`) but is
+/// not locked in RAM, so it may go to swap while the file is open. It opens
+/// only this one file; locking one per open file would soon hit the small
+/// `mlock` limit (macOS). Documented in README "Threat model" (review S3).
 pub struct ChunkCipher {
     cipher: Aes256Gcm,
 }

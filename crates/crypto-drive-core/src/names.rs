@@ -27,6 +27,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Error, Result};
 use crate::keys::{DirId, EntryId, Epoch};
+use crate::secret::LockedBox;
 use crate::vault::VaultKeys;
 
 /// Maximum length of a clear name in bytes.
@@ -55,9 +56,10 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Encrypts and decrypts names. The key is wiped on drop by `aes-siv`.
+/// Encrypts and decrypts names. The key is wiped on drop by `aes-siv` and
+/// its expanded state is locked in RAM (it holds the full `K_names`).
 pub struct NameCipher {
-    siv: Mutex<Aes256Siv>,
+    siv: Mutex<LockedBox<Aes256Siv>>,
 }
 
 impl NameCipher {
@@ -67,7 +69,7 @@ impl NameCipher {
         // The Array type has no zeroize support, so wipe the copy by hand.
         key.as_mut_slice().fill(0);
         Self {
-            siv: Mutex::new(siv),
+            siv: Mutex::new(LockedBox::new(siv)),
         }
     }
 
@@ -200,6 +202,14 @@ pub fn is_b64_char(c: char) -> bool {
 mod tests {
     use super::*;
     use crate::keys::{KeySet, MasterKey};
+
+    #[test]
+    fn name_cipher_state_is_locked_in_memory() {
+        // The expanded K_names must not go to swap (review S3).
+        let before = crate::secret::locked_bytes();
+        let _c = NameCipher::new(&[7u8; 64]);
+        assert!(crate::secret::locked_bytes() - before >= std::mem::size_of::<Aes256Siv>());
+    }
 
     const E: EntryId = [5u8; 16];
 

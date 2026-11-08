@@ -3,7 +3,7 @@
 Guide for Claude Code sessions in this repository. Read it fully at the start
 of every session. Last full project scan: 2026-11-01 (branch `main`,
 commit `34a0dee`, plus the open-file limit work). Last change: 2026-11-08
-(review findings S1 mode bits, S2 chmod without links).
+(review findings S1 mode bits, S2 chmod without links, S3 key hygiene).
 
 ## 0. Rules for Claude (always)
 
@@ -149,7 +149,7 @@ without a mount.
 | `check` | Read-only check of a whole vault; walks the real tree without the caches. |
 | `rotate` | Offline, resumable master key rotation. |
 | `recovery` | Recovery key (Crockford Base32, 55 chars, checksum). |
-| `secret` | `SecretBytes<N>`: heap, zeroized on drop, best-effort `mlock`. `random_bytes`. |
+| `secret` | `SecretBytes<N>`: heap, zeroized on drop, best-effort `mlock`. `LockedBox<T: ZeroizeOnDrop>`: a boxed cipher state, locked in RAM (used for `NameCipher`; `ChunkCipher` per open file is wiped but not locked, documented gap). Both go through `lock_memory` (test counter `locked_bytes`). `random_bytes`. |
 | `error` | One `Error` enum (thiserror) + `Result<T>`. Display texts are tested exactly. |
 | `testutil` | Feature `test-util`: `test_vault*()`, `real_name_of()`, `TEST_PASSWORD`. |
 
@@ -276,7 +276,10 @@ Check: `scripts/check-license-headers.sh`.
 - Dependencies: add the version only in the root `[workspace.dependencies]`
   and use `{ workspace = true }` in the crate. Stable crates, licenses
   allowed by `deny.toml`. Some are pinned with `=` (`rustix`, `log`, `lru`)
-  on purpose.
+  on purpose. Crypto crates keep their `zeroize` feature on (`aes-gcm`,
+  `aes-siv`, `sha2`, `hmac`); `keys.rs` has a compile-time test for it.
+  After a dependency change, also update `fuzz/Cargo.lock`
+  (`cargo +stable metadata --manifest-path fuzz/Cargo.toml --offline`).
 - Constants instead of magic numbers; names like `NAME_FILE`,
   `LONG_PREFIX`, `DEFAULT_MAX_NAME_LENGTH`.
 - Locks: `std::sync::Mutex` / `RwLock`, `.expect("<name> poisoned")`.
@@ -376,7 +379,8 @@ block).
 State at the last scan (2026-11-01): fmt clean, clippy clean, header check
 clean, `cargo test --workspace`: 511 passed, 0 failed, 10 ignored (9 mount
 tests + the golden generator). After S1 (2026-11-08): 516 passed, 0 failed,
-10 ignored. After S2: 520 passed, 0 failed, 10 ignored.
+10 ignored. After S2: 520 passed, 0 failed, 10 ignored. After S3: 524 passed,
+0 failed, 10 ignored.
 
 ## 8. Platform notes
 
@@ -498,10 +502,12 @@ and "Limits", `docs/format.md` section 8 notes.
   in its section 5). S1 done 2026-11-08 (commit `3fcf2df`), Linux container
   only, mount tests on the Mac pending: mode bits clamped to 0o777, `nosuid,nodev` always, warning on
   `-o allow_other` (owner may still choose to refuse it instead), README
-  threat model, `docs/format.md` 8 note, GitHub page. S2 done 2026-11-08,
-  not yet committed, Linux container only (macOS variant only cross-checked):
-  `set_mode` never follows links, README limit "needs /proc". Next: S3 + S4
-  + S5 (key hygiene). Then: the longer-term items
+  threat model, `docs/format.md` 8 note, GitHub page. S2 done 2026-11-08
+  (commit `c78f863`), Linux container only (macOS variant only cross-checked):
+  `set_mode` never follows links, README limit "needs /proc". S3 done
+  2026-11-08, not yet committed, Linux container only: `sha2`/`hmac` with
+  `zeroize`, `NameCipher` in a `LockedBox`, `ChunkCipher` swap gap in README
+  threat model and on the GitHub page. Next: S4 + S5 (daemon child). Then: the longer-term items
   (need owner decisions).
 - Open: Linux real-mount run; per-flush file key (format change, would fix
   chunk mixing); copy-on-write / journal for crash safety; stable inode

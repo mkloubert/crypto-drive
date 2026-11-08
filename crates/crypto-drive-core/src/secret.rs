@@ -18,13 +18,78 @@
 
 use crate::error::{Error, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 static MLOCK_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Returns true if any `mlock` call failed (the CLI prints one warning).
 pub fn mlock_failed() -> bool {
     MLOCK_FAILED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes this thread asked `mlock` to lock.
+    static LOCKED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes this thread asked `mlock` to lock (tests only).
+#[cfg(test)]
+pub(crate) fn locked_bytes() -> usize {
+    LOCKED_BYTES.with(std::cell::Cell::get)
+}
+
+/// Locks the heap memory of `value` in RAM, best effort. A failure is
+/// remembered for `mlock_failed`.
+fn lock_memory<T>(value: &T) {
+    let len = std::mem::size_of::<T>();
+    if len == 0 {
+        return;
+    }
+    #[cfg(test)]
+    LOCKED_BYTES.with(|n| n.set(n.get() + len));
+    let ptr = (value as *const T).cast_mut().cast::<std::ffi::c_void>();
+    // SAFETY: `ptr` points to `len` valid bytes of a value owned by a `Box`
+    // that stays alive and is not moved on the heap. mlock only changes
+    // paging, it does not touch the bytes.
+    if unsafe { rustix::mm::mlock(ptr, len) }.is_err() {
+        MLOCK_FAILED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A value with secret state (for example an expanded cipher key) on the
+/// heap, locked in RAM if possible. `T` must wipe itself on drop.
+///
+/// The value is built on the stack and then moved into the box; that stack
+/// copy is not wiped (Rust has no in-place construction). It is short-lived,
+/// but this is weaker than `SecretBytes`.
+pub struct LockedBox<T: ZeroizeOnDrop>(Box<T>);
+
+impl<T: ZeroizeOnDrop> LockedBox<T> {
+    pub fn new(value: T) -> Self {
+        let boxed = Box::new(value);
+        lock_memory(&*boxed);
+        Self(boxed)
+    }
+}
+
+impl<T: ZeroizeOnDrop> std::ops::Deref for LockedBox<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: ZeroizeOnDrop> std::ops::DerefMut for LockedBox<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T: ZeroizeOnDrop> std::fmt::Debug for LockedBox<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LockedBox(..)")
+    }
 }
 
 /// Returns `N` random bytes from the operating system.
@@ -41,12 +106,7 @@ impl<const N: usize> SecretBytes<N> {
     /// Moves `bytes` to the heap. The caller must zeroize its own copy.
     pub fn new(bytes: [u8; N]) -> Self {
         let boxed = Box::new(bytes);
-        let ptr = boxed.as_ptr() as *mut std::ffi::c_void;
-        // SAFETY: `ptr` points to `N` valid bytes owned by `boxed`, which stays
-        // alive and is not moved on the heap. mlock only changes paging.
-        if unsafe { rustix::mm::mlock(ptr, N) }.is_err() {
-            MLOCK_FAILED.store(true, Ordering::Relaxed);
-        }
+        lock_memory(&*boxed);
         Self(boxed)
     }
 
@@ -81,6 +141,22 @@ impl<const N: usize> std::fmt::Debug for SecretBytes<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locked_box_keeps_the_value_and_locks_it() {
+        let before = locked_bytes();
+        let b = LockedBox::new(zeroize::Zeroizing::new([3u8; 100]));
+        assert_eq!(b[..], [3u8; 100]);
+        assert_eq!(locked_bytes() - before, 100);
+        assert_eq!(format!("{b:?}"), "LockedBox(..)");
+    }
+
+    #[test]
+    fn secret_bytes_are_locked() {
+        let before = locked_bytes();
+        let _s = SecretBytes::new([5; 8]);
+        assert_eq!(locked_bytes() - before, 8);
+    }
 
     #[test]
     fn new_and_expose() {

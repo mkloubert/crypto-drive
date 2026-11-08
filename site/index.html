@@ -258,7 +258,7 @@
           <article class="reveal card p-6 transition hover:border-white/15">
             <div class="font-mono text-xs text-ember">[ hardened ]</div>
             <h3 class="mt-4 text-lg font-semibold">Careful with secrets</h3>
-            <p class="mt-2 text-sm leading-relaxed text-ash">Keys are wiped from memory and locked in RAM. No core dumps, no debugger attach. Logs never show clear names unless you ask with <code class="font-mono text-paper">--debug</code>.</p>
+            <p class="mt-2 text-sm leading-relaxed text-ash">Keys are wiped from memory and locked in RAM (the cipher of each open file is wiped, but not locked). No core dumps, no debugger attach. Logs never show clear names unless you ask with <code class="font-mono text-paper">--debug</code>.</p>
           </article>
         </div>
       </div>

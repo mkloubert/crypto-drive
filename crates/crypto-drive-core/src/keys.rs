@@ -236,6 +236,23 @@ fn expand<const N: usize>(hk: &Hkdf<Sha512>, label: &[u8]) -> SecretBytes<N> {
 mod tests {
     use super::*;
 
+    fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+    #[test]
+    fn hmac_states_are_wiped_on_drop() {
+        // `Hkdf<Sha512>` keeps an `Hmac<Sha512>` keyed with the epoch PRK
+        // (or the per-file PRK); `vault` uses `Hmac<Sha256>` with the check
+        // key (review S3). `Hmac` has no `ZeroizeOnDrop` marker itself, but
+        // it holds only two hash cores and a block buffer, and with the
+        // `zeroize` feature of `sha2` / `hmac` (digest, block-buffer) each of
+        // them wipes itself on drop. The buffered hashes prove the buffer.
+        use hmac::digest::block_api::CoreProxy;
+        wiped_on_drop::<<Sha512 as CoreProxy>::Core>();
+        wiped_on_drop::<<sha2::Sha256 as CoreProxy>::Core>();
+        wiped_on_drop::<Sha512>();
+        wiped_on_drop::<sha2::Sha256>();
+    }
+
     #[test]
     fn derive_is_deterministic() {
         let mk = MasterKey::from_bytes([7; 32]);
